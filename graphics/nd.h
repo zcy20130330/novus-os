@@ -217,6 +217,11 @@ void nd_boot_stage(UINT32 percent, const char *text);
  * alone instead of clearing them. */
 int nd_boot_splash_active(void);
 
+/* The framebuffer surface the boot splash draws into. Valid while the splash
+ * is active (before the desktop presents); used by the boot menu, which runs
+ * before nd_demo_init() binds the live compositor surface. */
+nd_surface_t *splash_surface(void);
+
 /* The desktop is about to be presented: the splash stops owning the
  * screen. */
 void nd_boot_splash_end(void);
@@ -240,6 +245,12 @@ void nd_fill_circle(nd_surface_t *s, INT32 cx, INT32 cy, INT32 radius,
                     nd_color_t c);
 void nd_circle(nd_surface_t *s, INT32 cx, INT32 cy, INT32 radius,
                nd_color_t c);
+/* Axis-aligned ellipse: FILL paints the interior, the outline version
+ * walks the same spans and touches only their two ends. */
+void nd_fill_ellipse(nd_surface_t *s, INT32 cx, INT32 cy, INT32 rx, INT32 ry,
+                     nd_color_t c);
+void nd_ellipse(nd_surface_t *s, INT32 cx, INT32 cy, INT32 rx, INT32 ry,
+                nd_color_t c);
 void nd_round_rect(nd_surface_t *s, nd_rect_t r, INT32 radius, nd_color_t c);
 void nd_round_frame(nd_surface_t *s, nd_rect_t r, INT32 radius, INT32 thick,
                     nd_color_t c);

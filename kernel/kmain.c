@@ -15,6 +15,7 @@
 #include "kernel.h"
 #include "vga.h"
 #include "serial.h"
+#include "irq.h"
 #include "shared_mem.h"
 #include "pmm.h"
 #include "mm.h"
@@ -43,14 +44,24 @@
 #include "gpt.h"
 #include "power.h"
 #include "session.h"
+#include "boot_menu.h"
 #include "nksym.h"
 #include "nkm.h"
+#include "novu_verify.h"
+#include "novu_queue.h"
+#include "novu_index.h"
+#include "novu_service.h"
+#include "cabundle.h"
+#include "net_http.h"
 /* M9: Win32 compatibility layer and its PE loader. */
 #include "win32.h"
 #include "pe.h"
 /* M5: NovusDisplay and the GUI widget library. */
 #include "nd.h"
+#include "nd_input.h"
+#include "con.h"
 #include "nd_font_uni.h"
+#include "nd_icon.h"
 /* M6: kernel-assisted IPC and the Novus-WM window manager. */
 #include "ipc.h"
 #include "nwm.h"
@@ -58,13 +69,20 @@
 #include "install.h"
 #include "lang.h"
 #include "sysinfo.h"
+#include "gpu.h"
+#include "gpu2d.h"
 #include "net.h"
 #include "irq.h"
 
 /* Unified output entry: mirror text to both VGA and COM1. */
 void kputs(const char *s) {
+  /* Reentrant: the timer ISR (and other interrupt handlers) also call kputs
+   * to mirror to the UART, whose byte-wise writes are not concurrency-safe.
+   * Serialize the whole write so two callers cannot interleave on COM1. */
+  UINT64 flags = irq_save();
   vga_puts(s);
   serial_puts(s);
+  irq_restore(flags);
 }
 
 void kputs_hex(UINT64 v) {
@@ -241,6 +259,16 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
    * machine's default disk) is gone from the firmware block-device list
    * after ExitBootServices, so drive it natively. */
   (void)ide_init();
+  /* Storage power: arm the idle timer explicitly instead of trusting the
+   * static initialiser in blkdev.c - the kernel's .data is laid out behind
+   * the boot-stage handoff block, so a default that lives there is not
+   * something to gamble a feature on. From here on a disk that sees no
+   * transfer for the timeout is spun down, and every drive is flushed and
+   * stopped on shutdown and reboot (kernel/power.c). */
+  blkdev_set_idle_timeout(BLKDEV_IDLE_SECONDS_DEFAULT);
+  kputs("[BLK] idle spin-down after ");
+  kputs_hex(BLKDEV_IDLE_SECONDS_DEFAULT);
+  kputs("s\n");
   /* Device manager: scan PCI once and cache it. This is the last moment
    * where a BAR probe (it writes 0xFFFFFFFF over every window) cannot
    * disturb a transfer: every storage driver has probed and the network
@@ -273,8 +301,16 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
   }
   storage_mount_ahci_novusfs();
   /* M5: pull the Unicode font out of the mounted system partition (an
-   * installed GPT partition, if present) so the desktop has CJK glyphs. */
+   * installed GPT partition, if present) so the desktop has CJK glyphs.
+   * Then look for an outline face in /Novus/font: when one is present it
+   * takes over drawing, and the bitmap table stays as the fallback for
+   * codepoints that face does not cover. */
   nd_font_load_from(novusfs_root());
+  (void)nd_font_load_ttf(novusfs_root());
+  /* Shell icons: the built-in ICO set is in the loader already; telling
+   * the decoder where the system partition is lets a user icon dropped
+   * into /Novus/icons override one of them. */
+  nd_icon_init(novusfs_root());
   if (vfs_selftest() != 0) {
     kputs("[WARN] VFS selftest failed, continuing degraded\n");
   }
@@ -346,6 +382,8 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
            * file manager can browse the standard tree. Persistence stays
            * off, so session_init() still starts a login-free live desktop. */
           nd_font_load_from(&livefs);
+          (void)nd_font_load_ttf(&livefs);
+          nd_icon_init(&livefs);
           novusfs_set_root(&livefs);
         }
       }
@@ -399,6 +437,48 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
     kputs("[WARN] NKM selftest failed, continuing degraded\n");
   }
 
+  /* Update subsystem foundation: the frozen 128-byte header, the 8-step
+   * verification pipeline and the five-level queue are linked and ready.
+   * The active daemon and HTTPS/TLS transport are layered on next. */
+  novu_queue_init();
+  novu_index_init();
+  novu_service_init(0);
+  if (novus_cabundle_count > 0u &&
+      novus_cabundle_count <= NOVUS_CABUNDLE_MAX) {
+    if (net_http_set_ca_set(novus_cabundle_der, novus_cabundle_off,
+                            novus_cabundle_root_len,
+                            novus_cabundle_count) == 0) {
+      kputs("[NET] https cabundle: vendor roots=");
+      kputs_hex((UINT64)novus_cabundle_count);
+      kputs("\n");
+    }
+  } else {
+    kputs("[NET] https fail-closed: no cabundle\n");
+  }
+#if NOVUS_HTTPS_E2E_PROBE
+  /* The QEMU reference server uses a dedicated test CA. It is trusted ONLY in
+   * an E2E build, and its private key never enters the OS image. */
+  if (net_http_add_ca(novus_e2e_root_der, novus_e2e_root_len) == 0) {
+    kputs("[E2E] QEMU test anchor added, total roots=");
+    kputs_hex((UINT64)net_http_root_count());
+    kputs("\n");
+  }
+#endif
+  kputs("[NOVU] update format hdr=");
+  {
+    char n[8];
+    UINT32 v = (UINT32)sizeof(novus_update_header_t);
+    int i = 0;
+    char rev[8];
+    int j = 0;
+    if (v == 0) { rev[j++] = '0'; }
+    while (v > 0 && j < 8) { rev[j++] = (char)('0' + (v % 10u)); v /= 10u; }
+    while (j > 0) { n[i++] = rev[--j]; }
+    n[i] = 0;
+    kputs(n);
+  }
+  kputs("B, verify+queue ready\n");
+
   /* LAPIC bring-up, then wake the B core (AP) with the kernel CR3. */
   nd_boot_stage(97, "唤醒多核");
   lapic_init();
@@ -450,11 +530,10 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
   (void)pe_selftest();
 #endif
 
-  /* M5: paint the demo desktop last, so the display shows the finished
-   * scene instead of being overwritten by later boot output. The desktop
-   * is composed off-screen and presented in one go, which is also the
-   * moment the boot splash leaves the screen. */
-#if CONFIG_NOVUS_DISPLAY
+  /* M5: the boot splash reaches its final stage here. The desktop is painted
+   * after the boot menu resolves; when there is no window manager to host the
+   * menu (display only), paint it straight away. */
+#if CONFIG_NOVUS_DISPLAY && !CONFIG_NOVUS_WM
   nd_boot_stage(99, "绘制桌面");
   nd_demo_init();
 #endif
@@ -463,33 +542,92 @@ void kmain(UINT64 mmap_addr, UINT64 map_size, UINT64 desc_size) {
    * shell through nd_demo_dispatch/nd_demo_paint), then a ring-3 client
    * is started that asks it for a window over IPC. */
 #if CONFIG_NOVUS_WM && CONFIG_NOVUS_DISPLAY
-  nwm_init();
-  /* M8: the sysinfo service and the three built-in applications. The
-   * apps are Rust programs embedded in this image (kernel/apps.c); the
-   * launcher buttons on the shell's taskbar start the same three later,
-   * which is why apps_launch() refuses a second copy. */
-  sysinfo_init();
   {
-    int install_mode = (shared_mem_get() != NULL &&
-                        shared_mem_get()->boot_mode == SHM_BOOT_MODE_INSTALL);
+    /* The "no desktop" boot option (stage3 text menu option 5) wants a pure
+     * text shell with no graphics at all: skip the window manager, the desktop,
+     * the graphical boot menu and the splash. nsh detects the absent WM port
+     * and runs a serial REPL over COM1. */
+    int no_graphics = (shared_mem_get() != NULL &&
+                       shared_mem_get()->boot_mode == SHM_BOOT_MODE_NO_DESKTOP);
 
-    /* The installer is the only session in install mode; on a live medium
-     * session_init() starts the desktop itself and there is no login
-     * window; an installed system still asks for an account. */
-    if (!install_mode) {
-      session_init();
-    }
-    /* M10: bring up PCI and the network stack before the applications, so
-     * the network app has a link to show and DHCP is already running. */
-    (void)net_init();
-    /* The network controllers only exist now; refresh the device table so
-     * the device manager shows the adapter that was just probed. */
-    devtab_refresh();
-    if (install_mode) {
-      kputs("[BOOT] install mode: starting the graphical installer\n");
-      (void)apps_launch_name("setup");
-    } else if (!session_live()) {
-      (void)apps_launch_name("session");
+    if (no_graphics) {
+      kputs("[BOOT] no-graphics mode: on-screen text console, window manager not started\n");
+      /* These do not need the window manager: net_init() enumerates the USB
+       * HID keyboard and the network, devtab_refresh() fills the device table.
+       * nd_input_init() arms the keyboard queue and con_init() binds the
+       * framebuffer text console nsh will draw into. */
+      (void)net_init();
+      devtab_refresh();
+      nd_input_init();
+      con_init(nd_screen());
+      (void)apps_launch_name("nsh");
+    } else {
+      nwm_init();
+      /* M8: the sysinfo service and the three built-in applications. The
+       * apps are Rust programs embedded in this image (kernel/apps.c); the
+       * launcher buttons on the shell's taskbar start the same three later,
+       * which is why apps_launch() refuses a second copy. */
+      /* GPU bring-up, step 1: find the display controller and prove its
+       * register window is reachable. The desktop keeps drawing on the
+       * GOP framebuffer; this puts the chip where the settings page and
+       * the boot log can show it. */
+      gpu_init();
+      /* 2D engine seam: decide who performs spans and blits before the
+       * first window is painted. The software path runs on the CPU over the
+       * firmware framebuffer; a vendor engine plugs in here when it exists. */
+      gpu2d_init();
+      sysinfo_init();
+      {
+        int install_mode = (shared_mem_get() != NULL &&
+                            shared_mem_get()->boot_mode == SHM_BOOT_MODE_INSTALL);
+
+        /* The installer is the only session in install mode; on a live medium
+         * session_init() marks the session live and logged in (no login window);
+         * an installed system still asks for an account. */
+        if (!install_mode) {
+          session_init();
+        }
+        /* M10: bring up PCI, the network stack and the USB HID keyboard before
+         * the applications, so the network app has a link to show, the device
+         * manager sees the adapter, and the boot menu can read arrow keys. */
+        (void)net_init();
+        devtab_refresh();
+
+        if (install_mode) {
+          nd_boot_stage(99, "绘制桌面");
+          nd_demo_init();
+          kputs("[BOOT] install mode: starting the graphical installer\n");
+          (void)apps_launch_name("setup");
+        } else {
+          /* The boot stage's text menu can already have chosen the shell:
+           * SHM_BOOT_MODE_NO_DESKTOP skips the graphical menu entirely. */
+          int no_desktop = (shared_mem_get() != NULL &&
+                            shared_mem_get()->boot_mode == SHM_BOOT_MODE_NO_DESKTOP);
+          if (no_desktop) {
+            kputs("[BOOT] boot stage chose no-desktop: skipping the menu\n");
+          } else {
+            /* Boot menu: choose the desktop (default) or a bare shell. It draws on
+             * the framebuffer, reads the USB keyboard and counts down two seconds
+             * before defaulting to the desktop. */
+            boot_menu_select();
+          }
+          if (no_desktop || g_boot_no_desktop) {
+            /* No desktop: end the splash, clear the screen and launch the shell
+             * directly. The window manager stays up to host the terminal. */
+            boot_menu_finish();
+            kputs("[BOOT] no-desktop mode: launching the shell\n");
+            (void)apps_launch_name("nsh");
+          } else {
+            nd_boot_stage(99, "绘制桌面");
+            nd_demo_init();
+            if (session_live()) {
+              session_start_desktop();
+            } else {
+              (void)apps_launch_name("session");
+            }
+          }
+        }
+      }
     }
   }
 #endif

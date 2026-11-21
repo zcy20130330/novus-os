@@ -40,6 +40,9 @@ static void desktop_start(void) {
       kputs("[SESSION] desktop app launch failed\n");
     }
   }
+  /* The Win32 samples are not auto-started: they live in /exe and are opened
+   * from the shell like any other program, so a stock desktop boots the same
+   * three shell apps every time. */
   if (shm->app_img_base != 0 && shm->app_img_size != 0 &&
       nuc_load((const void *)(UINTN)shm->app_img_base, shm->app_img_size, "demo") != 0) {
     kputs("[SESSION] staged app refused\n");
@@ -50,7 +53,8 @@ static int desktop_app(const char *name) {
   return text_equal(name, "fileman") || text_equal(name, "taskman") ||
       text_equal(name, "settings") || text_equal(name, "netman") ||
       text_equal(name, "devmgmt") || text_equal(name, "demo") ||
-      text_equal(name, "hello.exe");
+      text_equal(name, "hello.exe") || text_equal(name, "tlsdemo.exe") ||
+      text_equal(name, "msgdemo.exe") || text_equal(name, "fileio.exe");
 }
 
 static void desktop_stop(void) {
@@ -137,14 +141,13 @@ void session_init(void) {
   g_lock_until = 0;
 
   /* Live medium: the root is an image in reserved pages, so an account
-   * could not be stored across boots even if one were asked for. Start
-   * the desktop session directly; the first account is created only
-   * after an install onto a persistent NovusFS partition. */
+   * could not be stored across boots even if one were asked for. Mark the
+   * session live and logged in now; the desktop itself is started later by
+   * session_start_desktop() unless the boot menu chose the shell. */
   if (!vfs_root_persistent()) {
     g_live = 1;
     g_logged_in = 1;
     kputs("[SESSION] live session: no account required\n");
-    desktop_start();
     return;
   }
 
@@ -156,6 +159,16 @@ void session_init(void) {
 int session_logged_in(void) { return g_logged_in != 0; }
 
 int session_live(void) { return g_live != 0; }
+
+/* Start the desktop environment. Split out of session_init() so the boot
+ * menu can decide between the desktop and a bare shell before anything is
+ * launched. Safe to call once the session is live (or, on an installed
+ * system, after the user has logged in). */
+void session_start_desktop(void) {
+  if (g_live || g_logged_in) {
+    desktop_start();
+  }
+}
 
 static int write_record(void) {
   vfs_fs_t *fs = vfs_root();

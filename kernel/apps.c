@@ -156,6 +156,40 @@ int apps_launch_name(const char *name) {
  * NUC index, which the sysinfo /apps page and every spawn client rely on. */
 static const app_t g_win32[] = {
     {"hello.exe", k_app_hello_exe, &k_app_hello_exe_len},
+    {"window.exe", k_app_window_exe, &k_app_window_exe_len},
+    /* Console self-test for the loader's TEB and the TLS calls: it prints
+     * one line per check and exits, so it is the fastest way to tell
+     * whether a loader or scheduler change broke the thread block. */
+    {"tlsdemo.exe", k_app_tlsdemo_exe, &k_app_tlsdemo_exe_len},
+    /* Console self-test for the message loop: posted messages, timers,
+     * coordinate conversion and text measurement, one check per line. */
+    {"msgdemo.exe", k_app_msgdemo_exe, &k_app_msgdemo_exe_len},
+    /* Console self-test for the file calls and the library calls: it writes
+     * a file, reads it back, enumerates the directory, deletes it, and asks
+     * for the three built-in DLLs. */
+    {"fileio.exe", k_app_fileio_exe, &k_app_fileio_exe_len},
+    /* Console self-test for the socket surface: the ws2_32 handshake, the
+     * address conversions, and the honest failure a transport call gets
+     * while the kernel has no network stack. */
+    {"wsdemo.exe", k_app_wsdemo_exe, &k_app_wsdemo_exe_len},
+    /* Dialog controls: a window with STATIC, BUTTON and EDIT children, the
+     * click path into WM_COMMAND and typing into an edit. */
+    {"ctrldemo.exe", k_app_ctrldemo_exe, &k_app_ctrldemo_exe_len},
+    {"menudemo.exe", k_app_menudemo_exe, &k_app_menudemo_exe_len},
+    {"resdemo.exe", k_app_resdemo_exe, &k_app_resdemo_exe_len},
+    /* Typing into an edit: caret movement with the arrow keys, insertion in
+     * the middle, Tab between controls, and a button that prints what the
+     * buffer holds so the serial log can be checked against the keystrokes. */
+    {"editdemo.exe", k_app_editdemo_exe, &k_app_editdemo_exe_len},
+    /* The reported version and the compatibility mode: default Windows 11,
+     * switched to Windows 7 and XP through the registry, both calls checked
+     * against each other in every mode. */
+    {"verdemo.exe", k_app_verdemo_exe, &k_app_verdemo_exe_len},
+    /* Not runnable, and here to say so out loud: a real 32-bit PE image and a
+     * 16-bit .COM. Opening either has to produce the loader's one honest
+     * rejection line rather than a silent nothing. */
+    {"hello32.exe", k_app_hello32_exe, &k_app_hello32_exe_len},
+    {"dosdemo.com", k_app_dosdemo_com, &k_app_dosdemo_com_len},
 };
 
 UINT32 apps_win32_count(void) {

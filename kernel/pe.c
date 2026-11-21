@@ -22,7 +22,10 @@
 
 #define PE_DOS_SIG       0x5A4Du
 #define PE_NT_SIG        0x00004550u
+#define PE_MACHINE_I386  0x14Cu
 #define PE_MACHINE_AMD64 0x8664u
+#define PE_MACHINE_ARM64 0xAA64u
+#define PE_MAGIC_32      0x010Bu
 #define PE_MAGIC_PLUS    0x020Bu
 
 #define PE_DIR_IMPORT 1u
@@ -62,7 +65,181 @@ typedef struct {
   pe_sec_t sec[PE_MAX_SECTIONS];
 } pe_info_t;
 
-/* ---- little-endian readers --------------------------------------------- */
+/* ---- header probe ------------------------------------------------------- */
+
+/* The byte readers live below with the validator; the probe is above them so
+ * the log and the report can describe an image before any mapping happens. */
+static UINT16 rd16(const UINT8 *p);
+static UINT32 rd32(const UINT8 *p);
+static UINT64 rd64(const UINT8 *p);
+
+/* Reads the DOS/NT headers of any PE image, 32 or 64 bit, and says what it
+ * is. `pe_validate` below keeps to the subset this loader can execute; this
+ * function is the honest "what am I looking at" answer that a compatibility
+ * report and the rejection log both use. */
+int pe_probe(const UINT8 *img, UINT32 size, pe_probe_t *out) {
+  UINT32 e_lfanew;
+  UINT32 opt;
+  UINT32 opt_size;
+
+  if (img == 0 || out == 0 || size < 0x40u || rd16(img) != PE_DOS_SIG) {
+    return PE_ENOTPE;
+  }
+  e_lfanew = rd32(img + 0x3C);
+  if (e_lfanew < 0x40u || e_lfanew > size - 24u ||
+      rd32(img + e_lfanew) != PE_NT_SIG) {
+    return PE_ENOTPE;
+  }
+  memset(out, 0, sizeof(*out));
+  out->machine = rd16(img + e_lfanew + 4);
+  opt = e_lfanew + 24u;
+  opt_size = rd16(img + e_lfanew + 20);
+  if (opt_size < 64u || opt > size || opt_size > size - opt) {
+    return PE_EFORMAT;
+  }
+  out->magic = rd16(img + opt);
+  if (out->magic == PE_MAGIC_32) {
+    out->bits = 32;
+  } else if (out->magic == PE_MAGIC_PLUS) {
+    out->bits = 64;
+  } else {
+    return PE_EFORMAT;
+  }
+  out->subsystem = rd16(img + opt + 68);
+  out->os_major = rd16(img + opt + 40);
+  out->os_minor = rd16(img + opt + 42);
+  out->sub_major = rd16(img + opt + 48);
+  out->sub_minor = rd16(img + opt + 50);
+  out->is_dll = (UINT8)((rd16(img + e_lfanew + 22) & PE_FILE_DLL) != 0u);
+  out->entry_rva = rd32(img + opt + 16);
+  if (out->magic == PE_MAGIC_32) {
+    out->image_base = rd32(img + opt + 28);
+  } else {
+    out->image_base = rd64(img + opt + 24);
+  }
+  return 0;
+}
+
+static void cat_text(char *out, UINT32 cap, const char *s) {
+  UINT32 n = 0;
+  UINT32 i = 0;
+
+  while (n + 1u < cap && out[n] != '\0') {
+    n++;
+  }
+  while (n + 1u < cap && s[i] != '\0') {
+    out[n++] = s[i++];
+  }
+  out[n] = '\0';
+}
+
+static void cat_num(char *out, UINT32 cap, UINT32 v) {
+  char   tmp[12];
+  UINT32 n = 0;
+
+  if (v == 0u) {
+    cat_text(out, cap, "0");
+    return;
+  }
+  while (v != 0u && n < sizeof(tmp)) {
+    tmp[n++] = (char)('0' + (v % 10u));
+    v /= 10u;
+  }
+  while (n > 0u) {
+    char one[2];
+
+    one[0] = tmp[--n];
+    one[1] = '\0';
+    cat_text(out, cap, one);
+  }
+}
+
+/* The subsystem version is how a build declares the Windows generation it
+ * expects: 3.51 / 4.0 NT, 5.1 XP, 5.2 XP x64, 6.0 Vista, 6.1 Windows 7,
+ * 6.2 Windows 8, 6.3 Windows 8.1, 10.0 Windows 10 and 11. */
+static const char *subsystem_generation(UINT16 major, UINT16 minor) {
+  if (major <= 3u) {
+    return "NT 3.51";
+  }
+  if (major == 4u) {
+    return "Windows NT 4.0";
+  }
+  if (major == 5u && minor == 0u) {
+    return "Windows 2000";
+  }
+  if (major == 5u && minor == 1u) {
+    return "Windows XP";
+  }
+  if (major == 5u && minor == 2u) {
+    return "Windows XP x64 / Server 2003";
+  }
+  if (major == 6u && minor == 0u) {
+    return "Windows Vista";
+  }
+  if (major == 6u && minor == 1u) {
+    return "Windows 7";
+  }
+  if (major == 6u && minor == 2u) {
+    return "Windows 8";
+  }
+  if (major == 6u && minor == 3u) {
+    return "Windows 8.1";
+  }
+  if (major >= 10u) {
+    return "Windows 10/11";
+  }
+  return "an unknown Windows generation";
+}
+
+int pe_describe(const UINT8 *img, UINT32 size, char *out, UINT32 cap) {
+  pe_probe_t p;
+  int        rc;
+
+  if (out == 0 || cap == 0u) {
+    return PE_EFORMAT;
+  }
+  out[0] = '\0';
+  rc = pe_probe(img, size, &p);
+  if (rc == PE_ENOTPE) {
+    /* An MZ header without a PE signature is a 16-bit DOS image, which is
+     * the only thing a .com-style refusal can be about. */
+    if (size >= 2u && rd16(img) == PE_DOS_SIG) {
+      cat_text(out, cap, "DOS MZ executable (16-bit real mode)");
+      return PE_ENOTPE;
+    }
+    cat_text(out, cap, "not a PE image");
+    return PE_ENOTPE;
+  }
+  if (rc != 0) {
+    cat_text(out, cap, "PE headers damaged");
+    return rc;
+  }
+  cat_text(out, cap, (p.magic == PE_MAGIC_32) ? "PE32 " : "PE32+ ");
+  if (p.machine == PE_MACHINE_AMD64) {
+    cat_text(out, cap, "x86-64 ");
+  } else if (p.machine == PE_MACHINE_I386) {
+    cat_text(out, cap, "i386 ");
+  } else if (p.machine == PE_MACHINE_ARM64) {
+    cat_text(out, cap, "arm64 ");
+  } else {
+    cat_text(out, cap, "machine 0x");
+    cat_num(out, cap, p.machine);
+    cat_text(out, cap, " ");
+  }
+  cat_text(out, cap, (p.subsystem == 3u) ? "console " : "GUI ");
+  cat_text(out, cap, (p.is_dll != 0u) ? "DLL, " : "EXE, ");
+  cat_text(out, cap, "subsystem ");
+  cat_num(out, cap, p.sub_major);
+  cat_text(out, cap, ".");
+  cat_num(out, cap, p.sub_minor);
+  cat_text(out, cap, " (");
+  cat_text(out, cap, subsystem_generation(p.sub_major, p.sub_minor));
+  cat_text(out, cap, ")");
+  return 0;
+}
+
+/* ---- validation --------------------------------------------------------- */
+
 
 static UINT16 rd16(const UINT8 *p) {
   return (UINT16)((UINT16)p[0] | ((UINT16)p[1] << 8));
@@ -203,6 +380,14 @@ static int pe_validate(const UINT8 *img, UINT32 size, pe_info_t *out) {
     return PE_ENOTPE;
   }
   if (rd16(img + e_lfanew + 4) != PE_MACHINE_AMD64) {
+    /* A 32-bit image is well formed and simply not executable here: the
+     * layer runs x86-64 code, and a PE32 needs its own compatibility
+     * executor (a 32-bit code segment, a stack-based ABI and an interrupt
+     * entry instead of syscall). Saying so precisely keeps a .exe from being
+     * written off as a corrupt file. */
+    if (rd16(img + e_lfanew + 4) == PE_MACHINE_I386) {
+      return PE_E32;
+    }
     return PE_EMACHINE;
   }
 
@@ -327,15 +512,18 @@ static int pe_validate(const UINT8 *img, UINT32 size, pe_info_t *out) {
 
 /* Apply every IMAGE_REL_BASED_DIR64 entry. The image base and the load base
  * always differ here, so a missing table is a refusal, not a no-op. */
-static int pe_relocate(vm_space_t *sp, const pe_info_t *info) {
-  UINT64 delta = WIN32_IMAGE_BASE - info->image_base;
+static int pe_relocate(vm_space_t *sp, const pe_info_t *info, UINT64 base) {
+  UINT64 delta = base - info->image_base;
   UINT32 rva = info->dir_rva[PE_DIR_RELOC];
   UINT32 size = info->dir_size[PE_DIR_RELOC];
   UINT32 off = 0;
   UINT32 applied = 0;
 
   if (rva == 0u || size < 8u) {
-    return PE_ERELOC;
+    /* Nothing to relocate. That is only safe when the image did not move,
+     * which is exactly the case pe_load() arranged by mapping it at the
+     * base it was linked for. */
+    return (delta == 0u) ? 0 : PE_ERELOC;
   }
   while (off + 8u <= size) {
     UINT8 hdr[8];
@@ -344,7 +532,7 @@ static int pe_relocate(vm_space_t *sp, const pe_info_t *info) {
     UINT32 n;
     UINT32 i;
 
-    if (pe_read(sp, WIN32_IMAGE_BASE + rva + off, hdr, 8u) != 0) {
+    if (pe_read(sp, base + rva + off, hdr, 8u) != 0) {
       return PE_ERELOC;
     }
     page_rva = rd32(hdr);
@@ -360,7 +548,7 @@ static int pe_relocate(vm_space_t *sp, const pe_info_t *info) {
       UINT32 ofs;
       UINT64 value;
 
-      if (pe_read(sp, WIN32_IMAGE_BASE + rva + off + 8u + i * 2u,
+      if (pe_read(sp, base + rva + off + 8u + i * 2u,
                   raw, 2u) != 0) {
         return PE_ERELOC;
       }
@@ -372,11 +560,11 @@ static int pe_relocate(vm_space_t *sp, const pe_info_t *info) {
       if (type != PE_RELOC_DIR64 || applied >= PE_MAX_RELOCS) {
         return PE_ERELOC;
       }
-      if (pe_read(sp, WIN32_IMAGE_BASE + page_rva + ofs, &value, 8u) != 0) {
+      if (pe_read(sp, base + page_rva + ofs, &value, 8u) != 0) {
         return PE_ERELOC;
       }
       value += delta;
-      if (pe_write(sp, WIN32_IMAGE_BASE + page_rva + ofs, &value, 8u) != 0) {
+      if (pe_write(sp, base + page_rva + ofs, &value, 8u) != 0) {
         return PE_ERELOC;
       }
       applied++;
@@ -390,7 +578,7 @@ static int pe_relocate(vm_space_t *sp, const pe_info_t *info) {
 
 /* Fill the IAT with thunk addresses and write each distinct thunk once.
  * Returns the number of imported functions, or a PE_EIMPORT code. */
-static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
+static int pe_imports(vm_space_t *sp, const pe_info_t *info, UINT64 base) {
   UINT32 rva = info->dir_rva[PE_DIR_IMPORT];
   UINT32 size = info->dir_size[PE_DIR_IMPORT];
   UINT32 off = 0;
@@ -409,7 +597,7 @@ static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
     char dll[32];
     UINT32 i;
 
-    if (pe_read(sp, WIN32_IMAGE_BASE + rva + off, d, 20u) != 0) {
+    if (pe_read(sp, base + rva + off, d, 20u) != 0) {
       return PE_EIMPORT;
     }
     ilt = rd32(d);
@@ -419,7 +607,7 @@ static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
       return (int)total; /* terminator descriptor */
     }
     if (name_rva == 0u || iat == 0u ||
-        pe_cstr(sp, WIN32_IMAGE_BASE + name_rva, dll, sizeof(dll)) != 0) {
+        pe_cstr(sp, base + name_rva, dll, sizeof(dll)) != 0) {
       return PE_EIMPORT;
     }
 
@@ -431,7 +619,7 @@ static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
       UINT64 thunk_va;
       UINT8 code[WIN32_THUNK_LEN];
 
-      if (pe_read(sp, WIN32_IMAGE_BASE + (ilt != 0u ? ilt : iat) + i * 8u,
+      if (pe_read(sp, base + (ilt != 0u ? ilt : iat) + i * 8u,
                   &entry, 8u) != 0) {
         return PE_EIMPORT;
       }
@@ -443,7 +631,7 @@ static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
         return PE_EIMPORT;
       }
       fn_rva = (UINT32)(entry & 0x7FFFFFFFULL);
-      if (pe_cstr(sp, WIN32_IMAGE_BASE + fn_rva + 2u, func, sizeof(func)) != 0) {
+      if (pe_cstr(sp, base + fn_rva + 2u, func, sizeof(func)) != 0) {
         return PE_EIMPORT;
       }
       api = win32_api_lookup(dll, func);
@@ -455,15 +643,18 @@ static int pe_imports(vm_space_t *sp, const pe_info_t *info) {
         kputs("\n");
         return PE_EIMPORT;
       }
-      thunk_va = WIN32_THUNK_VA + (UINT64)(UINT32)api * WIN32_THUNK_LEN;
-      if (!used[api]) {
+      thunk_va = win32_api_entry((UINT32)api);
+      /* Only thunk slots need their code written; an entry that points at
+       * the dispatch stub page uses the code that page already holds. */
+      if (thunk_va == WIN32_THUNK_VA + (UINT64)(UINT32)api * WIN32_THUNK_LEN &&
+          !used[api]) {
         win32_thunk_bytes((UINT32)api, code);
         if (pe_write(sp, thunk_va, code, WIN32_THUNK_LEN) != 0) {
           return PE_EIMPORT;
         }
         used[api] = 1;
       }
-      if (pe_write(sp, WIN32_IMAGE_BASE + iat + i * 8u, &thunk_va, 8u) != 0) {
+      if (pe_write(sp, base + iat + i * 8u, &thunk_va, 8u) != 0) {
         return PE_EIMPORT;
       }
       total++;
@@ -484,9 +675,37 @@ static const UINT8 g_trampoline[] = {
     0xF4,                         /* hlt, if syscall ever returns */
 };
 
+/* Two pages of thread information at WIN32_TEB_VA, filled the way a Win32
+ * program expects to find it: %fs:0x30 points at itself, the client id
+ * lives at %fs:0x40, the stack bounds at %fs:0x08/0x10, and the 64 inline
+ * TLS slots at %fs:0x1480 - the array TlsAlloc() hands out and that a
+ * compiler's thread-local storage reads directly. Without it any program
+ * that touches %fs reads a null page; the TEB is also what makes the
+ * scheduler's MSR_FS_BASE switch meaningful. */
+static int pe_teb(vm_space_t *sp, UINT32 pid, UINT32 tid) {
+  UINT64 self = WIN32_TEB_VA;
+  UINT64 stack_base = WIN32_STACK_TOP;
+  UINT64 stack_limit = WIN32_STACK_TOP - WIN32_STACK_MIN;
+  UINT64 id64 = pid;
+
+  if (pe_map(sp, WIN32_TEB_VA, WIN32_TEB_PAGES, NULL, 0u,
+             VM_PROT_WRITE | VM_PROT_USER) != 0) {
+    return -1;
+  }
+  if (pe_write(sp, WIN32_TEB_VA + WIN32_TEB_SELF_OFF, &self, 8u) != 0 ||
+      pe_write(sp, WIN32_TEB_VA + 0x08u, &stack_base, 8u) != 0 ||
+      pe_write(sp, WIN32_TEB_VA + 0x10u, &stack_limit, 8u) != 0 ||
+      pe_write(sp, WIN32_TEB_VA + WIN32_TEB_PID_OFF, &id64, 8u) != 0) {
+    return -1;
+  }
+  id64 = tid;
+  return pe_write(sp, WIN32_TEB_VA + WIN32_TEB_TID_OFF, &id64, 8u);
+}
+
 int pe_load(const char *name, const UINT8 *img, UINT32 size) {
   pe_info_t info;
   vm_space_t sp;
+  UINT64 base;
   UINT32 entry;
   UINT32 pages;
   int imports;
@@ -497,12 +716,37 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
 
   rc = pe_validate(img, size, &info);
   if (rc != 0) {
+    char d[96];
+
+    /* The rejection line names what the image actually is, so "PE32 i386
+     * console EXE, subsystem 5.1 (Windows XP)" is distinguishable from a
+     * truncated file at a glance. */
+    d[0] = '\0';
+    (void)pe_describe(img, size, d, sizeof(d));
     kputs("[PE] ");
     kputs(name);
     kputs(": rejected (");
     kputs_hex((UINT64)(INT64)rc);
-    kputs(")\n");
+    kputs(") ");
+    kputs(d);
+    kputs(rc == PE_E32 ? " - 32-bit needs the WOW executor, not built\n"
+                       : "\n");
     return rc;
+  }
+  /* An image with no relocation data can only run where it was linked, so
+   * it is mapped there instead - the same rule Windows applies, and the
+   * reason such an image fails there when its preferred base is taken. The
+   * base has to stay clear of the TEB and everything above it. */
+  base = WIN32_IMAGE_BASE;
+  if (info.dir_rva[PE_DIR_RELOC] == 0u || info.dir_size[PE_DIR_RELOC] < 8u) {
+    if ((info.image_base & 0xFFFu) != 0u || info.image_base >= WIN32_TEB_VA ||
+        info.image_base + (UINT64)info.size_of_image > WIN32_TEB_VA) {
+      kputs("[PE] ");
+      kputs(name);
+      kputs(": no relocations and no room at its preferred base\n");
+      return PE_ERELOC;
+    }
+    base = info.image_base;
   }
   if (vm_space_create(&sp) != 0) {
     return PE_ENOMEM;
@@ -510,7 +754,7 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
 
   /* Headers, one page at a time. */
   pages = align_up(info.size_of_headers, 4096u) / 4096u;
-  if (pe_map(&sp, WIN32_IMAGE_BASE, pages, img, info.size_of_headers,
+  if (pe_map(&sp, base, pages, img, info.size_of_headers,
              VM_PROT_WRITE | VM_PROT_USER) != 0) {
     vm_space_free(&sp);
     return PE_ENOMEM;
@@ -529,7 +773,7 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
       if ((sec->chars & PE_SCN_EXEC) != 0u) {
         prot |= VM_PROT_EXEC;
       }
-      if (pe_map(&sp, WIN32_IMAGE_BASE + (UINT64)sec->va,
+      if (pe_map(&sp, base + (UINT64)sec->va,
                  sec->map_size / 4096u, img + sec->raw_ptr,
                  sec->raw_size, prot) != 0) {
         vm_space_free(&sp);
@@ -538,8 +782,9 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
     }
   }
 
-  /* One page of thunks, one page of command line. */
-  if (pe_map(&sp, WIN32_THUNK_VA, 1u, NULL, 0u,
+  /* Two pages of thunks (one would hold them today, two leaves room for the
+   * API table to grow), one page of command line, two pages of TEB. */
+  if (pe_map(&sp, WIN32_THUNK_VA, 2u, NULL, 0u,
              VM_PROT_WRITE | VM_PROT_USER | VM_PROT_EXEC) != 0 ||
       pe_map(&sp, WIN32_ARGV_VA, 1u, NULL, 0u,
              VM_PROT_WRITE | VM_PROT_USER) != 0) {
@@ -580,7 +825,7 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
     *(UINT64 *)phys_to_virt(top_phys) = WIN32_TRAMPOLINE;
   }
 
-  rc = pe_relocate(&sp, &info);
+  rc = pe_relocate(&sp, &info, base);
   if (rc != 0) {
     vm_space_free(&sp);
     kputs("[PE] ");
@@ -588,27 +833,36 @@ int pe_load(const char *name, const UINT8 *img, UINT32 size) {
     kputs(": relocation failed\n");
     return rc;
   }
-  imports = pe_imports(&sp, &info);
+  imports = pe_imports(&sp, &info, base);
   if (imports < 0) {
     vm_space_free(&sp);
     return imports;
   }
 
-  entry = WIN32_IMAGE_BASE + info.entry_rva;
+  entry = base + info.entry_rva;
   t = sched_create_user_ex(name, &sp, entry, WIN32_STACK_TOP - 8u,
                            TASK_ABI_WIN32);
   if (t == NULL) {
     vm_space_free(&sp);
     return PE_ENOMEM;
   }
-  t->win32_image_base = WIN32_IMAGE_BASE;
+  t->win32_image_base = base;
+  /* Process id is known only now (the scheduler assigns it), so the TEB is
+   * filled here rather than before the task exists. */
+  if (pe_teb(&t->space, (UINT32)t->pid, (UINT32)t->pid) == 0) {
+    t->teb_va = WIN32_TEB_VA;
+  } else {
+    kputs("[PE] ");
+    kputs(name);
+    kputs(": TEB not mapped, TlsAlloc will fail\n");
+  }
 
   kputs("[PE] ");
   kputs(name);
   kputs(": ");
   kputs_hex(info.num_sections);
   kputs(" sections, base ");
-  kputs_hex(WIN32_IMAGE_BASE);
+  kputs_hex(base);
   kputs(", entry ");
   kputs_hex(entry);
   kputs(", imports ");

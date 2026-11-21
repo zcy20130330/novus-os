@@ -374,8 +374,199 @@ fn render(win: &mut wm::Win, shell: &shell::Shell, scroll: &Scroll, input: &[u8]
     drawer.win.fill(caret_x, caret_y, 7, 13, accent);
 }
 
+/// The terminal's [`shell::Sink`] for the text console: bytes go straight to
+/// the on-screen framebuffer console (and are mirrored to the serial line).
+/// Status keywords (error/pass/...) are highlighted with ANSI colour; the
+/// kernel console parses SGR, and a serial terminal shows them too.
+struct SerialSink {
+    line: [u8; 1024],
+    n: usize,
+}
+
+impl SerialSink {
+    fn flush_line(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        let mut out = [0u8; 4096];
+        let mut o = 0usize;
+        let buf = &self.line[..self.n];
+        let mut i = 0usize;
+        while i < buf.len() {
+            let seg = i;
+            while i < buf.len() && !is_word(buf[i]) {
+                i += 1;
+            }
+            copy_to(&mut out, &mut o, &buf[seg..i]);
+            if i >= buf.len() {
+                break;
+            }
+            let w0 = i;
+            while i < buf.len() && is_word(buf[i]) {
+                i += 1;
+            }
+            let word = &buf[w0..i];
+            match color_for(word) {
+                Some(code) => {
+                    copy_to(&mut out, &mut o, b"\x1b[");
+                    copy_to(&mut out, &mut o, code);
+                    copy_to(&mut out, &mut o, b"m");
+                    copy_to(&mut out, &mut o, word);
+                    copy_to(&mut out, &mut o, b"\x1b[0m");
+                }
+                None => copy_to(&mut out, &mut o, word),
+            }
+        }
+        if o > 0 {
+            sys::console_write(&out[..o]);
+        }
+        self.n = 0;
+    }
+}
+
+impl Drop for SerialSink {
+    fn drop(&mut self) {
+        self.flush_line();
+    }
+}
+
+impl shell::Sink for SerialSink {
+    fn write(&mut self, data: &[u8]) {
+        for &b in data {
+            if self.n < self.line.len() {
+                self.line[self.n] = b;
+                self.n += 1;
+            }
+            if b == b'\n' {
+                self.flush_line();
+            } else if self.n >= self.line.len() {
+                self.flush_line();
+            }
+        }
+    }
+    fn clear_screen(&mut self) {
+        sys::console_write(b"\x1b[2J\x1b[H");
+    }
+}
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphabetic()
+}
+
+fn color_for(word: &[u8]) -> Option<&'static [u8]> {
+    let mut low = [0u8; 32];
+    if word.len() == 0 || word.len() > low.len() {
+        return None;
+    }
+    for i in 0..word.len() {
+        low[i] = word[i].to_ascii_lowercase();
+    }
+    let w = &low[..word.len()];
+    match w {
+        b"pass" | b"passed" | b"ok" | b"okay" | b"success" | b"succeed" | b"true"
+        | b"done" => Some(b"32"),
+        b"error" | b"err" | b"fail" | b"failed" | b"failure" | b"false" | b"fatal" => {
+            Some(b"31")
+        }
+        b"warn" | b"warning" | b"caution" => Some(b"33"),
+        _ => None,
+    }
+}
+
+fn copy_to(dst: &mut [u8], o: &mut usize, src: &[u8]) {
+    let mut i = 0usize;
+    while i < src.len() && *o < dst.len() {
+        dst[*o] = src[i];
+        *o += 1;
+        i += 1;
+    }
+}
+
+/// Runs the shell over the text console, with no window manager. Chosen
+/// automatically when the WM port is absent (e.g. the "no desktop" boot
+/// option, which never initialises graphics and draws straight to the
+/// framebuffer).
+fn console_mode() -> ! {
+    let mut shell = shell::Shell::new(0);
+    let mut prompt = [0u8; 128];
+    let mut input = [0u8; INPUT_MAX];
+    let mut ilen = 0usize;
+
+    sys::console_write(b"\x1b[2J\x1b[H");
+    sys::console_write(b"\x1b[36mNovus OS nsh (console)\x1b[0m - type 'help'.\r\n");
+
+    loop {
+        let plen = build_prompt(&shell, &mut prompt);
+        sys::console_write(b"\x1b[36m");
+        sys::console_write(&prompt[..plen]);
+        sys::console_write(b"\x1b[0m");
+
+        /* Read one command line, byte by byte, with minimal editing. */
+        let mut buf = [0u8; 64];
+        'line: loop {
+            let n = sys::console_read(&mut buf) as usize;
+            if n == 0 {
+                sys::yield_now();
+                continue;
+            }
+            for k in 0..n {
+                let b = buf[k];
+                match b {
+                    0x0d | 0x0a => {
+                        sys::console_write(b"\r\n");
+                        {
+                            let mut sink = SerialSink { line: [0u8; 1024], n: 0 };
+                            shell.run_line(&input[..ilen], &mut sink);
+                        }
+                        if ilen > 0 {
+                            shell.push_history(&input[..ilen]);
+                        }
+                        ilen = 0;
+                        break 'line;
+                    }
+                    0x7f | 0x08 => {
+                        if ilen > 0 {
+                            ilen -= 1;
+                            sys::console_write(b"\x08 \x08");
+                        }
+                    }
+                    0x03 => {
+                        sys::console_write(b"^C\r\n");
+                        ilen = 0;
+                        break 'line;
+                    }
+                    0x15 => {
+                        while ilen > 0 {
+                            ilen -= 1;
+                            sys::console_write(b"\x08 \x08");
+                        }
+                    }
+                    _ => {
+                        if b >= 0x20 && ilen < INPUT_MAX {
+                            input[ilen] = b;
+                            ilen += 1;
+                            sys::console_write(&buf[k..k + 1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    /* No window manager means no graphics: fall back to the text console,
+     * drawn straight to the framebuffer. This is how the "no desktop" boot
+     * option reaches a pure-text prompt without loading the UI. */
+    if ipc::lookup(wm::PORT_NAME).is_none() {
+        console_mode();
+    }
+    window_mode()
+}
+
+/// Graphical terminal: a window on the Novus desktop.
+fn window_mode() -> ! {
     let wm_port = match ipc::lookup(wm::PORT_NAME) {
         Some(p) => p,
         None => loop {},

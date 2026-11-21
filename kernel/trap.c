@@ -21,6 +21,8 @@
 #include "msr.h"
 #include "ipc.h"
 #include "irq.h"
+#include "serial.h"
+#include "con.h"
 #include "../fs/novusfs/novusfs.h"
 #include "../fs/vfs.h"
 #include "../fs/vfs_mount.h"
@@ -29,6 +31,13 @@
 #include "session.h"
 #include "install.h"
 #include "win32.h"
+#include "novu_format.h"
+#include "novu_service.h"
+#include "novu_index.h"
+#include "novu_queue.h"
+#include "novu_apply.h"
+#include "net.h"
+#include "net_http.h"
 
 /* Syscall numbers (README part 8: one table, one ABI). */
 #define SYS_YIELD       1u
@@ -56,6 +65,9 @@
 #define SYS_SESSION     18u
 #define SYS_SETUP       19u
 #define SYS_EXIT        60u
+#define SYS_UPDATE      25u   /* update service control ABI */
+#define SYS_HTTPS       26u   /* https client control ABI  */
+#define SYS_CONSOLE     27u   /* serial console read/write  */
 
 #define FS_PATH_MAX 256u
 #define FS_IO_MAX 4096u
@@ -833,6 +845,218 @@ typedef struct {
   sys_fn_t    fn;
 } sys_ent_t;
 
+/* Static staging for LIST replies (64 * 84 bytes), kept off the stack. */
+static user_update_info_t g_update_info[NOVU_INDEX_MAX];
+
+static void fill_info(user_update_info_t *di, const novus_index_record_t *r) {
+  UINT32 i;
+  __builtin_memcpy(di->uuid, r->uuid, 8);
+  di->type = r->type;
+  di->level = r->level;
+  di->state = r->state;
+  di->lock = r->lock;
+  di->installed_at = r->installed_at;
+  di->expires_at = r->expires_at;
+  di->before_ver = r->before_ver;
+  di->after_ver = r->after_ver;
+  for (i = 0; i < 48; i++) di->name[i] = r->name[i];
+}
+
+/* Update service control ABI (NOVU_OP_*). rdi = req, rsi = info out,
+ * rdx = info capacity (records). */
+static void sys_update_call(trap_frame_t *f) {
+  task_t *t = sched_current();
+  user_update_req_t req;
+  if (t == NULL || user_copy(t->cr3, f->rdi, &req, sizeof(req), 0) != 0) {
+    f->rax = (UINT64)-1;
+    return;
+  }
+  switch (req.op) {
+    case NOVU_OP_STATUS: {
+      const novu_service_t *s = novu_service_get();
+      f->rax = (UINT64)s->state;
+      break;
+    }
+    case NOVU_OP_LIST: {
+      UINT32 cap = (UINT32)f->rdx;
+      UINT32 n = novu_index_count();
+      UINT32 i;
+      if (cap > n) cap = n;
+      if (cap > NOVU_INDEX_MAX) cap = NOVU_INDEX_MAX;
+      for (i = 0; i < cap; i++) {
+        const novus_index_record_t *r = novu_index_get(i);
+        if (r != 0) fill_info(&g_update_info[i], r);
+      }
+      if (cap != 0 && user_copy(t->cr3, f->rsi, g_update_info,
+                                (UINT64)cap * sizeof(user_update_info_t),
+                                1) != 0) {
+        f->rax = (UINT64)-1;
+        return;
+      }
+      f->rax = (UINT64)n; /* total records, even if capped */
+      break;
+    }
+    case NOVU_OP_CHECK:
+      novu_service_request_check();
+      f->rax = 0;
+      break;
+    case NOVU_OP_ROLLBACK:
+      f->rax = (UINT64)(INT64)novu_apply_undo_last();
+      break;
+    case NOVU_OP_DEFER:
+      novu_queue_defer(req.uuid);
+      f->rax = 0;
+      break;
+    case NOVU_OP_IGNORE:
+      novu_queue_ignore(req.uuid);
+      f->rax = 0;
+      break;
+    default:
+      f->rax = (UINT64)-1; /* ENOSYS until the transport/UI path lands */
+      break;
+  }
+}
+
+/* HTTPS client control ABI (NOVU_HTTP_*): rdi = req, rsi = out, rdx = cap.
+ * Only IPv4 literals are accepted here; DNS resolution is a separate step.
+ * Without an installed cabundle https_get fails closed (returns -1). */
+static UINT8 g_https_buf[NET_HTTP_MAX];
+
+static void sys_https_call(trap_frame_t *f) {
+  task_t *t = sched_current();
+  user_https_req_t req;
+  UINT32 ip = 0, part = 0, dots = 0, i;
+  int ok = 1, rc;
+
+  if (t == NULL || user_copy(t->cr3, f->rdi, &req, sizeof(req), 0) != 0) {
+    f->rax = (UINT64)-1;
+    return;
+  }
+  for (i = 0; req.host[i] != 0 && i < 16u; i++) {
+    char c = req.host[i];
+    if (c >= '0' && c <= '9') {
+      part = part * 10u + (UINT32)(c - '0');
+      if (part > 255u) {
+        ok = 0;
+        break;
+      }
+    } else if (c == '.') {
+      ip |= part << (8u * dots);
+      part = 0;
+      dots++;
+    } else {
+      ok = 0;
+      break;
+    }
+  }
+  if (!ok || dots != 3u) {
+    UINT32 spins = 0;
+    if (net_dns_resolve(req.host) != 0) {
+      f->rax = (UINT64)-1;
+      return;
+    }
+    while (net_dns_status() == 1) {
+      sched_yield();
+      if (++spins > 2000000u) {
+        f->rax = (UINT64)-1;
+        return;
+      }
+    }
+    if (net_dns_status() != 2) {
+      f->rax = (UINT64)-1;
+      return;
+    }
+    ip = net_dns_addr();
+  } else {
+    ip |= part << 24;
+  }
+  if (net_http_ready() == 0) {
+    f->rax = (UINT64)-1; /* no cabundle: fail closed */
+    return;
+  }
+  rc = https_get(ip, (UINT16)(req.port != 0u ? req.port : 443u), req.host,
+                 req.path, 0u, g_https_buf, sizeof(g_https_buf));
+  if (rc <= 0) {
+    f->rax = (UINT64)-1;
+    return;
+  }
+  if (user_copy(t->cr3, f->rsi, g_https_buf, (UINT64)rc, 1) != 0) {
+    f->rax = (UINT64)-1;
+    return;
+  }
+  f->rax = (UINT64)rc;
+}
+
+/* Serial console for the no-graphics shell. op 0 writes a byte buffer to
+ * COM1 (raw: the driver turns '\\n' into CRLF); op 1 drains the RX queue
+ * into a buffer, non-blocking, and returns the byte count (0 when empty).
+ * This is deliberately separate from SYS_WRITE, whose output is a prefixed
+ * kernel log line, not an application's stdout. */
+static void sys_console(trap_frame_t *f) {
+  UINT64 cr3 = (sched_current() != 0) ? sched_current()->cr3 : 0;
+  UINT64 op = f->rdi;
+  UINT64 len = f->rdx;
+  UINT8  tmp[128];
+
+  if (cr3 == 0) {
+    f->rax = (UINT64)-1;
+    return;
+  }
+  if (op == 0u) { /* write: to the on-screen console (mirrored to serial) */
+    UINT64 done = 0;
+
+    while (done < len) {
+      UINT64 chunk = len - done;
+
+      if (chunk > sizeof(tmp)) {
+        chunk = sizeof(tmp);
+      }
+      if (user_copy(cr3, f->rsi + done, tmp, chunk, 0) != 0) {
+        f->rax = (UINT64)-1;
+        return;
+      }
+      con_out(tmp, (UINT32)chunk);
+      done += chunk;
+    }
+    f->rax = len;
+  } else if (op == 1u) { /* read: keyboard when a console is bound, else serial */
+    UINT64 got = 0;
+
+    while (got < len) {
+      UINT64 room = len - got;
+      UINT64 n = 0;
+
+      if (room > sizeof(tmp)) {
+        room = sizeof(tmp);
+      }
+      if (con_ready()) {
+        n = con_in_read(tmp, (UINT32)room);
+      } else {
+        int r;
+        while (n < room) {
+          r = serial_getc();
+          if (r < 0) {
+            break;
+          }
+          tmp[n] = (UINT8)r;
+          n++;
+        }
+      }
+      if (n == 0u) {
+        break;
+      }
+      if (user_copy(cr3, f->rsi + got, tmp, n, 1) != 0) {
+        f->rax = (UINT64)-1;
+        return;
+      }
+      got += n;
+    }
+    f->rax = got;
+  } else {
+    f->rax = (UINT64)-1;
+  }
+}
+
 /* README part 8: one numbered table, one ABI. A new call is a new row;
  * nothing else in the kernel needs to know its number. */
 static const sys_ent_t g_syscalls[] = {
@@ -862,6 +1086,9 @@ static const sys_ent_t g_syscalls[] = {
     {SYS_SETUP, "setup", sys_setup},
     {SYS_EXIT, "exit", sys_exit_call},
     {SYS_WIN32, "win32", win32_syscall},
+    {SYS_UPDATE, "update", sys_update_call},
+    {SYS_HTTPS, "https", sys_https_call},
+    {SYS_CONSOLE, "console", sys_console},
 };
 
 /* Unknown numbers are reported once each and refused; a wrong ABI must be

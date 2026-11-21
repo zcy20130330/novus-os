@@ -8,6 +8,7 @@
 
 #include "kernel.h"
 #include "sched.h"
+#include "blkdev.h"
 #include "gdt.h"
 #include "idt.h"
 #include "lapic.h"
@@ -20,6 +21,7 @@
 #include "nwm.h"
 #include "sysinfo.h"
 #include "net.h"
+#include "novu_service.h"
 #include "nuc.h"
 #include "win32.h"
 
@@ -48,6 +50,10 @@ static UINT32  g_next_id;
 static UINT32  g_exit_count;
 static UINT64  g_ticks;
 static UINT32  g_logged_switches;
+/* Set once sched_start() has entered ring 3. The per-tick subsystem hooks
+ * (WM, sysinfo, network, update daemon, NovusDisplay) only make sense once
+ * a real task is running; before that they touch uninitialised state. */
+static int     g_sched_started;
 
 /* A task that exited on the last switch. Its pages cannot be returned at
  * the point of the switch - the CPU is still running on its ring-0 stack
@@ -252,9 +258,21 @@ static void sched_dump_tasks(void) {
   }
 }
 
+/* Kernel idle. Nothing is runnable, so this is the only place the machine
+ * can look at its disks without racing a transfer: a device that has seen
+ * no I/O for the configured timeout gets spun down here (blkdev.h). The
+ * timer still wakes the loop every tick, so the table is examined once a
+ * second rather than on every wake-up - a spin-down is a command round
+ * trip, not a comparison. */
 static void sched_kernel_idle(void) {
+  UINT64 last_sweep = 0;
+
   for (;;) {
     __asm__ volatile("sti; hlt");
+    if (sched_ticks() - last_sweep >= 100u) {
+      last_sweep = sched_ticks();
+      blkdev_idle_sweep(0);
+    }
   }
 }
 
@@ -289,6 +307,10 @@ static UINT64 sched_enter_kidle(void) {
   }
   g_current = NULL;
   vm_switch_cr3(mm_kernel_cr3());
+  /* The kernel idle context is ring 0 and has no TEB; leaving a user's
+   * %fs base installed here would let kernel code dereference a pointer
+   * into that task's address space after it has been switched out. */
+  msr_write(MSR_FS_BASE, 0u);
   return sched_kidle_frame();
 }
 
@@ -427,6 +449,15 @@ UINT64 sched_switch_frame(UINT64 current_frame) {
     task_reap(dead);
   }
 
+  /* Before sched_start() nothing may be switched in: the frame being
+   * returned belongs to kernel code on the BSP (the boot menu or the
+   * desktop bring-up), there is no task frame to save, and entering the
+   * idle task from here loses the kernel thread for good. Return the frame
+   * untouched and let the caller iretq straight back. */
+  if (!g_sched_started) {
+    return current_frame;
+  }
+
   if (g_current != NULL) {
     if (g_current->state == TASK_RUNNING) {
       /* Save the frame and put the task back in the ring: without the
@@ -484,6 +515,10 @@ UINT64 sched_switch_frame(UINT64 current_frame) {
   tss_set_rsp0(next->kstack_top);
   sys_kernel_rsp = next->kstack_top;
   vm_switch_cr3(next->cr3);
+  /* %fs is a per-core register, so it has to follow the task: a Win32
+   * process reads its TEB and its TLS slots through it, and the next task
+   * would otherwise inherit the previous one's. */
+  msr_write(MSR_FS_BASE, next->teb_va);
   return next->rsp;
 }
 
@@ -533,9 +568,16 @@ void sched_tick(void) {
       kputs(g_current->name);
       kputs("\n");
     }
-  } else {
+  } else if (g_sched_started) {
     /* Kernel idle: ask for a switch every tick so the first process that
-     * becomes runnable (a taskbar click forks one) is entered promptly. */
+     * becomes runnable (a taskbar click forks one) is entered promptly.
+     *
+     * This must not happen before sched_start(). The boot menu runs on the
+     * BSP with interrupts enabled and g_current is still NULL, so a request
+     * here would send the timer's return path through sched_switch_frame(),
+     * which would pick the idle task and iretq into ring 3 - the menu never
+     * finishes, the desktop is never painted and the machine looks frozen on
+     * the splash. A tick before start only advances the counter. */
     g_need_resched = 1;
     if ((g_ticks % 40u) == 0u) {
       kputs("[SCHED] ticks=");
@@ -552,22 +594,42 @@ void sched_tick(void) {
     (void)nuc_create_idle();
   }
 
+  /* The per-tick subsystem hooks below only make sense once a real task is
+   * running (they drive the desktop, network and update daemon). Before
+   * sched_start() they touch uninitialised state and must be skipped - this
+   * is what lets the boot menu enable interrupts for keyboard input without
+   * the timer ISR corrupting kernel state. */
+  if (g_sched_started) {
 #if CONFIG_NOVUS_WM
-  /* M6: Novus-WM drives the whole desktop from the tick - input routing,
-   * the IPC server queue and the compositor. M5's nd_demo_tick() is what
-   * runs instead when the window manager is configured out. */
-  nwm_tick();
-  /* M8: the sysinfo service shares the tick with the WM. */
-  sysinfo_tick();
-  /* M10: drain network receive queues and run DHCP/ICMP/TCP timers. Bounded work
-   * per tick - eight frames and a handful of timers. */
-  net_tick();
+    /* M6: Novus-WM drives the whole desktop from the tick - input routing,
+     * the IPC server queue and the compositor. M5's nd_demo_tick() is what
+     * runs instead when the window manager is configured out. */
+    nwm_tick();
+    /* M8: the sysinfo service shares the tick with the WM. */
+    sysinfo_tick();
+    /* M10: drain network receive queues and run DHCP/ICMP/TCP timers. Bounded work
+     * per tick - eight frames and a handful of timers. */
+    net_tick();
+    /* Update daemon: rate-limited state machine / journal replay. Bounded,
+     * sampled every NOVU_TICK_INTERVAL ticks. */
+    novu_service_tick((UINT32)g_ticks);
 #elif CONFIG_NOVUS_DISPLAY
-  /* M5: NovusDisplay shares the tick. Input is decoded from the IRQ queue
-   * and at most one damage rectangle is repainted per event, so the cost
-   * stays bounded and the scheduler's own work is unaffected. */
-  nd_demo_tick();
+    /* M5: NovusDisplay shares the tick. Input is decoded from the IRQ queue
+     * and at most one damage rectangle is repainted per event, so the cost
+     * stays bounded and the scheduler's own work is unaffected. */
+    nd_demo_tick();
 #endif
+  }
+
+  /* Storage idle sweep, once a second, outside the per-subsystem hooks: a
+   * desktop shell always leaves a task runnable, so the kernel idle loop is
+   * never reached and this tick is the only periodic point the machine
+   * gets. Only backends that can be entered from an IRQ take part
+   * (blkdev.h); the sweep itself is two comparisons per disk until one has
+   * really been quiet for the whole timeout. */
+  if ((g_ticks % 100u) == 0u) {
+    blkdev_idle_sweep(1);
+  }
 }
 
 void sched_exit_current(int code) {
@@ -613,6 +675,12 @@ void sched_park(UINT64 port, UINT32 timeout_ticks) {
   g_current->wait_err = 0;
   g_current->state = TASK_BLOCKED;
   g_need_resched = 1;
+  /* Parking on IPC is as close to "nothing to do" as this scheduler gets
+   * while a desktop task still exists - the idle loop below is only
+   * reached once no task is runnable at all. Both call the same sweep,
+   * which is a couple of integer comparisons until a disk has actually
+   * been quiet for the whole timeout. */
+  blkdev_idle_sweep(0);
 }
 
 void sched_wake_port(UINT64 port) {
@@ -844,11 +912,13 @@ void sched_start(void) {
     }
   }
   g_current = first;
+  g_sched_started = 1; /* per-tick subsystem hooks are now safe to run */
   first->state = TASK_RUNNING;
   first->slice = task_slice(first);
   tss_set_rsp0(first->kstack_top);
   sys_kernel_rsp = first->kstack_top;
   vm_switch_cr3(first->cr3);
+  msr_write(MSR_FS_BASE, first->teb_va);
 
   kputs("[SCHED] entering ring 3: ");
   kputs(first->name);

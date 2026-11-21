@@ -45,7 +45,7 @@ OBJCOPY := $(CROSS)objcopy
 ifeq ($(shell command -v $(CC) 2>/dev/null),)
 ifeq ($(strip $(MAKECMDGOALS)),)
 $(error $(CC) not found in PATH. Install the mingw-w64 x86-64 cross toolchain (e.g. package gcc-mingw-w64-x86-64) or set CROSS=<toolchain-prefix>.)
-else ifneq ($(filter-out cppcc cppcc-demo,$(MAKECMDGOALS)),)
+else ifneq ($(filter-out clean cppcc cppcc-demo,$(MAKECMDGOALS)),)
 $(error $(CC) not found in PATH. Install the mingw-w64 x86-64 cross toolchain (e.g. package gcc-mingw-w64-x86-64) or set CROSS=<toolchain-prefix>.)
 endif
 endif
@@ -63,6 +63,10 @@ CPPCC_RUN_DEP := $(if $(filter y,$(CONFIG_USER_CPPCC)),cppcc-demo,)
 
 # Guest memory handed to QEMU by 'make run'.
 MEM ?= 4G
+
+# When set to 1, the kernel performs a one-shot HTTPS probe at boot (logged to
+# the serial console) for end-to-end verification against a local updatesrv.
+E2E ?= 0
 
 # ---------------------------------------------------------------------------
 # Sources and flags
@@ -88,7 +92,9 @@ SRC := arch/x86_64/boot/main.c \
         kernel/power.c \
     kernel/trap.c \
     kernel/session.c \
-       kernel/sched.c \
+    kernel/con.c \
+    kernel/boot_menu.c \
+    kernel/sched.c \
        kernel/vm.c \
        kernel/nuc.c \
        kernel/pe.c \
@@ -101,6 +107,7 @@ SRC := arch/x86_64/boot/main.c \
        kernel/gpt.c \
        kernel/nksym.c \
        graphics/nd_font.c \
+       graphics/nd_ttf.c \
        graphics/nd_font_uni.c \
        graphics/nd_ime_dict.c \
        graphics/nd_ime.c \
@@ -110,6 +117,7 @@ SRC := arch/x86_64/boot/main.c \
        graphics/nd_input.c \
        graphics/nd_jpeg.c \
        graphics/nd_wallpaper.c \
+       graphics/nd_icon.c \
        graphics/nvgui.c \
        graphics/nd_theme.c \
        graphics/nd_lang.c \
@@ -124,6 +132,8 @@ SRC := arch/x86_64/boot/main.c \
        kernel/devtab.c \
        kernel/rtc.c \
        kernel/pci.c \
+       kernel/gpu.c \
+       kernel/gpu2d.c \
        kernel/net.c \
        kernel/net_dhcp.c \
        kernel/net_tcp.c \
@@ -135,6 +145,7 @@ SRC := arch/x86_64/boot/main.c \
        kernel/net_virtio.c \
        kernel/net_rtl8139.c \
        kernel/net_wifi.c \
+       kernel/net_http.c \
        wm/novus-wm/nwm.c \
        wm/novus-wm/nwm_demo.c \
        fs/novusfs/super.c \
@@ -158,14 +169,46 @@ SRC := arch/x86_64/boot/main.c \
        fs/ext4/inode.c \
        fs/ext4/dir.c \
        fs/ext4/vfs_ext4.c \
-       security/nkm/nkm.c
+       security/nkm/nkm.c \
+       security/novu/novu_verify.c \
+       security/novu/novu_queue.c \
+       security/novu/novu_index.c \
+       security/novu/novu_delta.c \
+       security/novu/novu_manifest.c \
+       security/novu/novu_service.c \
+       security/novu/novu_apply.c \
+       security/novu/cabundle.c \
+       security/tls/aes.c \
+       security/tls/gcm.c \
+       security/tls/hkdf.c \
+       security/tls/x25519.c \
+       security/tls/asn1.c \
+       security/tls/chacha20poly1305.c \
+       security/tls/rsa.c \
+       security/tls/p256.c \
+       security/tls/csprng.c \
+       security/tls/x509.c \
+       security/tls/hmac.c \
+       security/tls/prf.c \
+       security/tls/chain.c \
+       security/tls/record.c \
+       security/tls/tls13_keys.c \
+       security/tls/tls13_msg.c \
+       security/tls/tls13_client.c \
+       security/tls/tls12_client.c
+
+# The QEMU test CA is trusted ONLY in an E2E build. Production images carry
+# the real vendor root set alone (security/novu/cabundle.c).
+ifeq ($(E2E),1)
+SRC += security/novu/cabundle_e2e.c
+endif
 
 # Assembly sources. Uppercase .S (case-sensitive) makes gcc run the C
 # preprocessor over the file first; gcc invokes the assembler itself.
 ASM_SRC := arch/x86_64/kernel/entry.S arch/x86_64/kernel/trap.S arch/x86_64/kernel/chkstk.S
 
 INC := -Iarch/x86_64/include -Ikernel -Igraphics -Iwm/novus-wm -Ifs/novusfs -Ifs \
-       -Ifs/fat -Ifs/iso9660 -Isecurity/nkm -Ibuild
+       -Ifs/fat -Ifs/iso9660 -Isecurity/nkm -Isecurity/novu -Isecurity/tls -Ibuild
 
 # Freestanding UEFI environment: no libc, no host runtime, no stack
 # protector, no PIC, no Red Zone (interrupts may clobber it), small code
@@ -191,11 +234,14 @@ CFLAGS += -DCONFIG_NOVUS_A_CORE_DISABLE=$(if $(filter y,$(CONFIG_NOVUS_A_CORE_DI
           -DCONFIG_NOVUS_IPC=$(if $(filter y,$(CONFIG_NOVUS_IPC)),1,0) \
           -DCONFIG_NOVUS_PCI=$(if $(filter y,$(CONFIG_NOVUS_PCI)),1,0) \
           -DCONFIG_NOVUS_NET=$(if $(filter y,$(CONFIG_NOVUS_NET)),1,0) \
-          -DCONFIG_NOVUS_WIN32=$(if $(filter y,$(CONFIG_NOVUS_WIN32)),1,0)
+          -DCONFIG_NOVUS_WIN32=$(if $(filter y,$(CONFIG_NOVUS_WIN32)),1,0) \
+          -DNOVUS_HTTPS_E2E_PROBE=$(E2E) \
+          $(if $(filter 1,$(E2E)),-DTLS13_KERN_DEBUG=1,)
 
 # Link as a PE32+ EFI application: subsystem 10 = EFI application,
 # image entry point is efi_main.
-LDFLAGS := -shared -nostdlib -Wl,-dll -Wl,--subsystem,10 -Wl,-e,efi_main
+LDFLAGS := -shared -nostdlib -Wl,-dll -Wl,--subsystem,10 -Wl,-e,efi_main \
+           -Wl,--strip-debug
 
 # Flat object naming: path separators become underscores, e.g.
 #   arch/x86_64/boot/main.c -> build/arch_x86_64_boot_main.o
@@ -203,6 +249,20 @@ LDFLAGS := -shared -nostdlib -Wl,-dll -Wl,--subsystem,10 -Wl,-e,efi_main
 # list: no two entries collapse onto the same build/xxx.o; the explicit
 # per-file rules below never need the reverse mapping).
 OBJS := $(foreach src,$(SRC) $(ASM_SRC),build/$(subst /,_,$(basename $(src))).o)
+
+# make does not track changes to a rule's command line or CFLAGS, so switching
+# E2E=0 <-> E2E=1 would otherwise silently reuse objects compiled with the
+# other flag set (e.g. a probe with no test anchor, or production objects with
+# E2E-only symbols). Record the full flag string in a stamp whose mtime only
+# changes when the flags change, and make every object depend on it.
+CFLAGS_STAMP := build/.cflags
+$(shell mkdir -p build && \
+  printf '%s\n' '$(CFLAGS)' > build/.cflags.tmp && \
+  if ! cmp -s build/.cflags.tmp $(CFLAGS_STAMP); then \
+    mv build/.cflags.tmp $(CFLAGS_STAMP); \
+  else \
+    rm -f build/.cflags.tmp; \
+  fi)
 
 # ---------------------------------------------------------------------------
 # Rust static library (lib/novuslib-rs)
@@ -261,7 +321,7 @@ all: banner out/NOVUS.EFI
 
 # Configuration summary printed before anything is built.
 banner:
-    @echo "Novus OS build: arch=$(CONFIG_NOVUS_ARCH) min_mem=$(CONFIG_NOVUS_MIN_MEMORY_MB)MB smp=$(CONFIG_NOVUS_SMP) a_core_disable=$(CONFIG_NOVUS_A_CORE_DISABLE) novusfs=$(CONFIG_NOVUS_NOVUSFS) wal=$(CONFIG_NOVUS_WAL) merkle=$(CONFIG_NOVUS_MERKLE) nkm=$(CONFIG_NOVUS_NKM) installer=$(CONFIG_NOVUS_INSTALLER) display=$(CONFIG_NOVUS_DISPLAY) gui=$(CONFIG_NOVUS_GUI) ipc=$(CONFIG_NOVUS_IPC) wm=$(CONFIG_NOVUS_WM) cppcc=$(CONFIG_USER_CPPCC) win32=$(CONFIG_NOVUS_WIN32)"
+	@echo "Novus OS build: arch=$(CONFIG_NOVUS_ARCH) min_mem=$(CONFIG_NOVUS_MIN_MEMORY_MB)MB smp=$(CONFIG_NOVUS_SMP) a_core_disable=$(CONFIG_NOVUS_A_CORE_DISABLE) novusfs=$(CONFIG_NOVUS_NOVUSFS) wal=$(CONFIG_NOVUS_WAL) merkle=$(CONFIG_NOVUS_MERKLE) nkm=$(CONFIG_NOVUS_NKM) installer=$(CONFIG_NOVUS_INSTALLER) display=$(CONFIG_NOVUS_DISPLAY) gui=$(CONFIG_NOVUS_GUI) ipc=$(CONFIG_NOVUS_IPC) wm=$(CONFIG_NOVUS_WM) cppcc=$(CONFIG_USER_CPPCC) win32=$(CONFIG_NOVUS_WIN32)"
 
 # ---------------------------------------------------------------------------
 # Wallpaper photos (assets/backgrounds)
@@ -282,13 +342,18 @@ banner:
 # after the 'all' target on purpose: make takes the first target it sees as
 # the default.
 WP_DIR    := assets/backgrounds-screen
-WP_IMGS := $(WP_DIR)/pexels-snapsbyclark-12981877.jpg \
+WP_IMGS := $(WP_DIR)/novus-paper-polar.jpg \
+           $(WP_DIR)/novus-paper-ring.jpg \
+           $(WP_DIR)/novus-paper-strata.jpg \
+           $(WP_DIR)/novus-paper-lattice.jpg \
+           $(WP_DIR)/novus-paper-daylight.jpg \
            $(WP_DIR)/pexels-codioful-6985184.jpg \
            $(WP_DIR)/pexels-ian-panelo-40321675.jpg \
            $(WP_DIR)/mrbinz-vietnam-10445204_1920.jpg \
            $(WP_DIR)/pexels-thales13-40360883.jpg \
            $(WP_DIR)/pexels-tu-n-vu-2153773491-40278712.jpg \
-           $(WP_DIR)/treptoweralex-usa-9889580.jpg
+           $(WP_DIR)/treptoweralex-usa-9889580.jpg \
+           $(WP_DIR)/pexels-snapsbyclark-12981877.jpg
 
 FONT_UI_SOURCES := $(wildcard graphics/*.c kernel/*.c wm/novus-wm/*.c) \
                    $(shell find apps/src -name '*.rs' -type f)
@@ -296,6 +361,47 @@ build/nd_font_fallback.h: tools/fontgen/fallback.py graphics/nd_font_data.bin $(
 	python3 tools/fontgen/fallback.py $@
 
 build/graphics_nd_font.o: build/nd_font_fallback.h
+
+# ---------------------------------------------------------------------------
+# Shell icons (assets/icons)
+# ---------------------------------------------------------------------------
+# The SVG sources are rendered to ICO by tools/icons/mkico.py on the host and
+# committed; the Makefile only needs to turn those ICO files into C blobs so
+# the decoder in graphics/nd_icon.c has a built-in set on a medium with no
+# system partition. A matching file in /Novus/icons/<name>.ico still wins at
+# runtime - see graphics/nd_icon.h.
+ICON_DIR  := assets/icons
+ICON_IMGS := $(wildcard $(ICON_DIR)/*.ico)
+ICON_BLOB_H := build/icons_blobs.h
+
+$(ICON_BLOB_H): $(ICON_IMGS) | build
+	@{ \
+	  echo '/* generated from assets/icons by the Makefile - do not edit */'; \
+	  echo '#ifndef NOVUS_ICONS_BLOBS_H'; \
+	  echo '#define NOVUS_ICONS_BLOBS_H'; \
+	  for f in $(ICON_IMGS); do \
+	    n=`basename $$f .ico`; \
+	    c=`echo $$n | tr '-' '_'`; \
+	    echo '/* '"$$n"'.ico */'; \
+	    xxd -i -n k_ico_$$c $$f; \
+	  done; \
+	  echo 'typedef struct {'; \
+	  echo '  const char        *name;'; \
+	  echo '  const unsigned char *data;'; \
+	  echo '  unsigned int       len;'; \
+	  echo '} nd_icon_blob_row_t;'; \
+	  echo 'static const nd_icon_blob_row_t g_icon_blob_rows[] = {'; \
+	  for f in $(ICON_IMGS); do \
+	    n=`basename $$f .ico`; \
+	    c=`echo $$n | tr '-' '_'`; \
+	    echo '  {"'"$$n"'", k_ico_'"$$c"', (unsigned int)sizeof(k_ico_'"$$c"')},'; \
+	  done; \
+	  echo '};'; \
+	  echo '#define ND_ICON_BLOB_COUNT (sizeof(g_icon_blob_rows) / sizeof(g_icon_blob_rows[0]))'; \
+	  echo '#endif'; \
+	} > $@
+
+build/graphics_nd_icon.o: $(ICON_BLOB_H)
 
 # Link the final EFI image. Static archives go after the plain objects so
 # the linker extracts members on demand; the tramp_blob object carries the
@@ -360,11 +466,18 @@ $(APPS_BLOB_H): $(APPS_BINS) | build
 # the kernel's PE loader has a genuine import table and relocation table to
 # process. It is linked at 0x400000 while the kernel maps it at 0x50000000,
 # which forces the base relocation path that M9 exists to exercise.
-WIN32_SRC    := user/win32compat/samples/hello.c
-WIN32_BIN    := out/win32/hello.exe
+WIN32_BINS   := out/win32/hello.exe out/win32/window.exe out/win32/tlsdemo.exe out/win32/msgdemo.exe out/win32/fileio.exe out/win32/wsdemo.exe out/win32/ctrldemo.exe out/win32/menudemo.exe out/win32/resdemo.exe out/win32/editdemo.exe out/win32/verdemo.exe
+# Not compilable here: this toolchain has no 32-bit target, and a .COM is
+# 16-bit real mode rather than a container. Both are written byte for byte by
+# tools/mkpe32.py so the loader's refusal path has real inputs.
+WIN32_GEN    := out/win32/hello32.exe out/win32/dosdemo.com
 WIN32_BLOB_H := build/win32_blobs.h
 
-$(WIN32_BIN): $(WIN32_SRC) | out
+# hello.exe proves the console and memory calls; window.exe proves the
+# user32 path (class, window, message loop, paint). Both are linked at
+# 0x400000 while the kernel maps them at 0x50000000, which forces the
+# base relocation path M9 exists to exercise.
+out/win32/%.exe: user/win32compat/samples/%.c | out
 	@mkdir -p $(@D)
 	$(CC) -O2 -ffreestanding -fno-stack-protector \
 	    -fno-asynchronous-unwind-tables -mno-stack-arg-probe \
@@ -372,13 +485,48 @@ $(WIN32_BIN): $(WIN32_SRC) | out
 	    -Wl,--subsystem,console -Wl,--image-base,0x400000 \
 	    -Wl,--dynamicbase -Wl,--enable-reloc-section \
 	    -Wl,--disable-auto-import -Wl,-e,novus_win32_main \
-	    -o $@ $< -lkernel32 -ladvapi32
+	    -o $@ $< -lkernel32 -ladvapi32 -luser32 -lgdi32 -lws2_32
 
-$(WIN32_BLOB_H): $(WIN32_BIN) | build
+# resdemo.exe carries a .rsrc section: windres turns the .rc into a COFF
+# object and the linker puts it in the image, which is how a Windows program
+# gets its strings and menus out of itself.
+out/win32/resdemo.res.o: user/win32compat/samples/resdemo.rc | out
+	windres -I user/win32compat/samples -i $< -o $@
+
+out/win32/resdemo.exe: user/win32compat/samples/resdemo.c out/win32/resdemo.res.o | out
+	$(CC) -O2 -ffreestanding -fno-stack-protector \
+	    -fno-asynchronous-unwind-tables -mno-stack-arg-probe \
+	    -nostdlib -nostartfiles \
+	    -Wl,--subsystem,console -Wl,--image-base,0x400000 \
+	    -Wl,--dynamicbase -Wl,--enable-reloc-section \
+	    -Wl,--disable-auto-import -Wl,-e,novus_win32_main \
+	    -o $@ $< out/win32/resdemo.res.o \
+	    -lkernel32 -ladvapi32 -luser32 -lgdi32 -lws2_32
+
+# Two images that exist to be recognised and refused rather than run:
+# a PE32 (32-bit) image and a raw 16-bit .COM. Written by the script because
+# no 32-bit compiler is installed here.
+$(WIN32_GEN): tools/mkpe32.py | out
+	@mkdir -p out/win32
+	python3 tools/mkpe32.py out/win32
+
+$(WIN32_BLOB_H): $(WIN32_BINS) $(WIN32_GEN) | build
 	@{ echo '/* Generated by the build: M9 Win32 sample images. */'; \
 	   echo '#ifndef NOVUS_WIN32_BLOBS_H'; \
 	   echo '#define NOVUS_WIN32_BLOBS_H'; \
-	   xxd -i -n k_app_hello_exe $(WIN32_BIN); \
+	   xxd -i -n k_app_hello_exe out/win32/hello.exe; \
+	   xxd -i -n k_app_window_exe out/win32/window.exe; \
+	   xxd -i -n k_app_tlsdemo_exe out/win32/tlsdemo.exe; \
+	   xxd -i -n k_app_msgdemo_exe out/win32/msgdemo.exe; \
+	   xxd -i -n k_app_fileio_exe out/win32/fileio.exe; \
+	   xxd -i -n k_app_wsdemo_exe out/win32/wsdemo.exe; \
+	   xxd -i -n k_app_ctrldemo_exe out/win32/ctrldemo.exe; \
+	   xxd -i -n k_app_menudemo_exe out/win32/menudemo.exe; \
+	   xxd -i -n k_app_resdemo_exe out/win32/resdemo.exe; \
+	   xxd -i -n k_app_editdemo_exe out/win32/editdemo.exe; \
+	   xxd -i -n k_app_verdemo_exe out/win32/verdemo.exe; \
+	   xxd -i -n k_app_hello32_exe out/win32/hello32.exe; \
+	   xxd -i -n k_app_dosdemo_com out/win32/dosdemo.com; \
 	   echo '#endif'; } > $@
 
 # apps.c includes the generated headers; nothing else does.
@@ -411,7 +559,7 @@ $(TRAMP_BLOB_OBJ): $(TRAMP_BLOB_S) | build
 # path):
 #   arch/x86_64/boot/main.c -> build/arch_x86_64_boot_main.o
 define COMPILE_rule
-build/$(subst /,_,$(basename $(1))).o: $(1) | build
+build/$(subst /,_,$(basename $(1))).o: $(1) $(CFLAGS_STAMP) | build
 	$$(CC) $$(CFLAGS) -c $$< -o $$@
 endef
 $(foreach src,$(SRC) $(ASM_SRC),$(eval $(call COMPILE_rule,$(src))))

@@ -48,8 +48,9 @@ static struct {
 } g_splash __attribute__((section(".data")));
 
 /* The surface to draw on: the real screen once the kernel has bound it,
- * otherwise a temporary view of the captured framebuffer. */
-static nd_surface_t *splash_surface(void) {
+ * otherwise a temporary view of the captured framebuffer. Exported so the
+ * boot menu can draw on the same surface the splash uses. */
+nd_surface_t *splash_surface(void) {
   nd_surface_t       *s = nd_screen();
   const nd_display_t *d;
 
@@ -62,6 +63,17 @@ static nd_surface_t *splash_surface(void) {
   d = nd_display();
   if (d == 0 || !d->available || d->fb_phys == 0 ||
       d->fb_phys >= 0x100000000ULL || d->width == 0 || d->height == 0) {
+    /* The splash draws before the paging layer exists, so it can only use a
+     * framebuffer the boot identity map already covers. On a discrete card
+     * the firmware framebuffer lives inside the card's VRAM aperture, which
+     * is above 4 GiB: the splash is skipped there and the first thing drawn
+     * is the desktop, through the aperture mapping set up later. Say why
+     * instead of going quiet. */
+    if (d != 0 && d->available && d->fb_phys >= 0x100000000ULL) {
+      kputs("[ND] boot splash skipped: framebuffer at ");
+      kputs_hex(d->fb_phys);
+      kputs(" is above the 4 GiB identity map\n");
+    }
     return 0;
   }
   g_splash.scratch.px = (UINT32 *)(UINTN)d->fb_phys;

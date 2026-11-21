@@ -147,15 +147,28 @@ typedef struct {
  * would blow the 40-shape budget. */
 #define NWM_OP_ROUND_FILL  6u
 #define NWM_OP_ROUND_FRAME 7u
+/* v1.3: the two shapes a windowed program draws with a pen. LINE runs from
+ * (x,y) to (x+w,y+h), so a straight segment of any slope costs one shape
+ * instead of a staircase of FILLs. ELLIPSE is centred on (x,y) with radii
+ * w and h; ELLIPSE_FILL paints the interior too, which is the order GDI
+ * needs for Ellipse (brush first, then the pen outline on top). */
+#define NWM_OP_LINE         8u
+#define NWM_OP_ELLIPSE      9u
+#define NWM_OP_ELLIPSE_FILL 10u
 
 /* One shape in the v1.1 display list. `pad` is the corner radius for the
- * v1.2 rounded ops and zero otherwise. */
+ * v1.2 rounded ops and zero otherwise. `seq` is stamped by the compositor
+ * when the command arrives so the frame replays in the order the program
+ * submitted it: a layer that paints a menu over a client has to be able to
+ * cover text the client drew earlier in the same frame. */
 typedef struct {
   UINT32 win;
   UINT8  op; /* NWM_OP_* */
   UINT8  pad;
   INT16  x, y, w, h;
   UINT32 color;
+  UINT16 seq;
+  UINT16 pad3;
 } nwm_shape_t;
 
 /* One text run. `scale` 1 is 5x7, 2 is double; coordinates are relative
@@ -167,6 +180,8 @@ typedef struct {
   UINT8  len;
   UINT32 color;
   char   text[NWM_TEXT_MAX];
+  UINT16 seq;
+  UINT16 pad3;
 } nwm_text_t;
 
 typedef struct {
