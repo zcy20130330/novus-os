@@ -1362,6 +1362,10 @@ static int control_xfer(usb_t *u, const UINT8 setup[8], UINT8 *buf,
   UINT32 trt = (len == 0u) ? 0u : (dir_in != 0 ? 3u : 2u);
   UINT32 start_cycle;
   UINT32 pass;
+  /* B-54: how long this pass actually took, in milliseconds. "No completion"
+   * and "a completion sixteen milliseconds later" are the same silence on the
+   * page otherwise, and only one of them is a device timing problem. */
+  UINT32 t_pass_ms;
 
   /* One retry, and only after the defined endpoint recovery: a control
    * transfer that produced no completion at all leaves the controller's
@@ -1371,6 +1375,7 @@ static int control_xfer(usb_t *u, const UINT8 setup[8], UINT8 *buf,
    * whole wait budget first. */
   for (pass = 0u; pass < 2u; pass++) {
   td_count = 0u;
+  t_pass_ms = usb_ms_now();
   /* U-62: one line per control transfer, before anything is written. The
    * transfer index and cycle this driver thinks it is appending at, next to
    * the controller's own dequeue on the failure line, is what separates
@@ -1537,6 +1542,8 @@ static int control_xfer(usb_t *u, const UINT8 setup[8], UINT8 *buf,
       kputs_hex(setup[0]);
       kputs(" bRequest=");
       kputs_hex(setup[1]);
+      kputs(" ms=");
+      kputs_hex((UINT64)(usb_ms_now() - t_pass_ms));
       kputs(" ep0_phys=");
       kputs_hex(u->ep0_phys);
       kputs(" data_phys=");
@@ -1625,6 +1632,8 @@ static int control_xfer(usb_t *u, const UINT8 setup[8], UINT8 *buf,
   kputs_hex(u->ep0_idx);
   kputs(" cy=");
   kputs_hex(u->ep0_cycle);
+  kputs(" ms=");
+  kputs_hex((UINT64)(usb_ms_now() - t_pass_ms));
   kputs("\n");
   return 0;
   }
@@ -2277,6 +2286,64 @@ static void xhci_legacy_handoff(volatile UINT32 *cap, UINT32 hcc1) {
       }
       uwr(c, 0x08, urd(c, 0x08) | 0xE0000000u);
       return;
+    }
+    xecp = nxt;
+  }
+}
+
+/* B-54: one line that says what the controller claims about itself, next to
+ * one line per USB protocol range it exposes. On metal the interesting facts
+ * are not "is it running" (that is already on the page) but "how many ports
+ * does it admit to", "does it have a real port power switch" (HCCPARAMS1.PPC)
+ * and "which of those ports are USB2 and which are USB3" - a mouse on a
+ * laptop sits on a USB2 range even when the socket is blue, and a bring-up
+ * that resets the wrong range looks exactly like a device that never answers.
+ * QEMU exposes one flat range, so none of this distinguishes anything there;
+ * it is read-only and costs two register reads per capability. */
+static void xhci_caps_report(xhci_t *hc) {
+  UINT32 hcs1 = urd(hc->cap, 0x04);
+  UINT32 hcc1 = urd(hc->cap, 0x10);
+  UINT32 hcc2 = urd(hc->cap, 0x1C);
+  UINT32 dboff = urd(hc->cap, 0x14);
+  UINT32 rtsoff = urd(hc->cap, 0x18);
+  UINT32 xecp = (hcc1 >> 16) & 0xFFFFu;
+  UINT32 walk = 0u;
+
+  kputs("[USB] caps hcs1=");
+  kputs_hex(hcs1);
+  kputs(" hcc1=");
+  kputs_hex(hcc1);
+  kputs(" hcc2=");
+  kputs_hex(hcc2);
+  kputs(" dboff=");
+  kputs_hex(dboff);
+  kputs(" rtsoff=");
+  kputs_hex(rtsoff);
+  kputs("\n");
+
+  while (xecp != 0u && walk++ < 32u) {
+    volatile UINT32 *c = (volatile UINT32 *)((volatile UINT8 *)hc->cap +
+                                            (UINTN)xecp * 4u);
+    UINT32 hdr = urd(c, 0x00);
+    UINT8  id = (UINT8)(hdr & 0xFFu);
+    UINT8  nxt = (UINT8)((hdr >> 8) & 0xFFu);
+
+    if (id == 2u) { /* supported protocol: which port range speaks what */
+      UINT32 dw1 = urd(c, 0x04);
+      UINT32 dw2 = urd(c, 0x08);
+
+      /* The revision dword is printed raw: its major/minor split has moved
+       * between spec revisions (and QEMU's encoding is not the laptop's),
+       * so a hex word is the only honest thing to log. */
+      kputs("[USB] proto rev=");
+      kputs_hex(dw1);
+      kputs(" ports=");
+      kputs_hex(dw2 & 0xFFu);
+      kputs("+");
+      kputs_hex((dw2 >> 8) & 0xFFu);
+      kputs(" speeds=");
+      kputs_hex((dw2 >> 16) & 0xFFFFu);
+      kputs("\n");
     }
     xecp = nxt;
   }
@@ -4911,6 +4978,7 @@ int usb_init(void) {
     kputs(" event=");
     kputs_hex(hc->ev_phys);
     kputs("\n");
+    xhci_caps_report(hc);
 
     /* No port is reset or enumerated here any more. This function now stops
      * at "the controller is running and its ports have been looked at once";

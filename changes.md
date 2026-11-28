@@ -1629,3 +1629,23 @@ switch 内原分支保留作兜底。
 - 只有 QEMU 读数：QEMU 的 USB 探测几乎不花时间，所以 `stage spin ticks=1` 只是“证明通路打通了”，真机那 30 s 会长出几百帧；观感与帧数要等明天真机。
 - 覆盖有边界：不经过 `cpu_delay_us()` / `usb_delay_ms()` / `ep0_wait_stopped()` 的纯寄存器轮询（例如个别 AHCI 忙等）仍然不会 tick。
 - 没有动 PIT/LAPIC 定时器与 IDT：加一个启动期定时源能覆盖全部阶段，但那是动中断基础设施，风险明显高于收益，本轮只做了“借等待循环”。
+
+## B-54 USB 侧探针：控制器自述、端口协议范围、EP0 等待耗时
+
+**为什么** 真机上“鼠标不亮、`usb mice=0`”一直被归因成“南桥没初始化”。这个归因本身站不住（PCH 若真没起来，AHCI/NVMe 一起挂，根本到不了桌面），但顺着它去看会发现真正缺的证据是三样：控制器自己声称有多少口、哪些口属于 USB2 哪些属于 USB3、以及 EP0 到底是“没答”还是“答晚了”。这三样以前只能靠报告页上的端口数组反推。
+
+**做法**（全部只读，不改任何初始化顺序）
+1. `xhci_caps_report()`：一行 `[USB] caps hcs1=… hcc1=… hcc2=… dboff=… rtsoff=…`。`hcc1` 的 bit 3 是 PPC（有无真正的端口电源开关），MaxPorts 在 `hcs1` 的 24:31。
+2. 同一个能力链里逐条打印 Supported Protocol（id=2）：`[USB] proto rev=<raw> ports=<起始>+<数量> speeds=<PSIC>`。起始+数量决定“鼠标所在的口是不是 USB2 范围”，这是 QEMU 与真机差别最大的地方（QEMU 只有一条扁平范围）。
+3. 控制传输成功与失败两侧都加上 `ms=`：`[USB] xfer done … ms=0x…`、`[USB] ep0 rc … ms=0x…`。`ms` 取自 `usb_ms_now()`，从本次 pass 开头起算；没有校正时钟时退化成 `g_pace_us` 的累计值，读数仍是真实的等待时间。
+
+**验证** 构建 `exit=0`。QEMU（nvme 引导镜像 + `qemu-xhci` + usb-kbd/usb-tablet），日志出现：
+- `[USB] caps hcs1=0x08001040 hcc1=0x0087001 hcc2=0 dboff=0x2000 rtsoff=0x1000`
+- `[USB] proto rev=0x20425355 ports=5+4 speeds=0`（QEMU 的 rev 字段是 ASCII "USB "，不是 major/minor；所以按原始 word 打印，不做解释）
+- `[USB] xfer done port=5 step=3 … ms=0x7`，随后各请求 3–7 ms
+- 桌面照常进（`[BA] handoff spin ticks=4`、`[BA] stage spin ticks=1`）
+
+**未做/未验证**
+- `speeds`(PSIC) 非 0 时，PSI 表本身没有打印（只打了计数）；真机若要精确到“PSIV=4 才是 SuperSpeed”，需要再加一行读 0x0C+4*i。
+- `rev` 字段的 major/minor 拆分在规范版本间挪过位置，因此只打 raw word；真机上看到两条 proto 时，按“起始=1 的那条是 USB2”判断，不由该字段判断。
+- 镜像换了：`E78889921EEE675BD89EAAB8E0DF2652`（`novus-desktop.img`，64 MiB）。B-53 那版 `0E933CD15879F39B` 作废，U 盘要按新哈希重刷。
