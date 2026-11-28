@@ -1675,3 +1675,11 @@ switch 内原分支保留作兜底。
 - 蓝屏不接管键盘：`cli` 之后不响应任何输入，也没有“重启”按钮，只能断电/复位——与 Windows 不一样，是有意的（panic 里不接受任何设备交互）。
 - 诊断页的另一个用途（“指针仍无效时拍照取证”）随之消失：现在取证靠 `out/` 里从 U 盘读回的日志；U 盘写不进去时机器就只剩串口，这是删页面的代价。
 - B-54 那版镜像 `E78889921EEE675BD89EAAB8E0DF2652` 作废，U 盘要按 `90EF9F5D599B48C5C0C3DCA1476EAD3A` 重刷。
+
+**待定（与仓库既有规则的冲突，等 chen 定）** B-55 的 “B 核起不来就蓝屏” 与仓库里多处成文规则相反，这些文档本轮一条未改：
+- `ARCHITECTURE.md:37/107`、`docs/en/ARCHITECTURE.md:35/77`：SIPI 失败降级单核、不 panic；
+- `CONTRIBUTING.md:384`：SIPI 失败应降级单核，不得 panic 或死锁；`:707`：轻微错误不 panic 的 PR 原则；
+- `COMPATIBILITY.md:113`、`GLOSSARY.md:77-78`、`ROADMAP.md:49/255`（及 `docs/en/` 对应页）同口径；
+- `docs/Novus OS Debug 级接口手册 V1.0.md:787`：把 `[SMP] WARN AP wake timeout` 记为普通告警，现在这行之后会进蓝屏。
+
+两种收法：(a) 保留蓝屏，把上述文档统一改成“无法继续运行 = 蓝屏、自检类失败仍降级”；(b) 只有 ring0 异常蓝屏，`smp.c` 恢复 `break` 降级单核。代码目前按 (a) 落地，chen 定了再动文档或回滚 `smp.c`。
