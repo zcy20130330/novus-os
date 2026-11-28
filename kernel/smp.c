@@ -30,6 +30,7 @@
 #include "lapic.h"
 #include "cpu.h"
 #include "serial.h"
+#include "panic.h"
 
 #ifndef CONFIG_NOVUS_SMP
 #define CONFIG_NOVUS_SMP 0
@@ -300,7 +301,11 @@ void smp_wake_ap(UINT64 kernel_cr3, UINT64 mmap, UINT64 map_size,
       kputs("[SMP] WARN AP wake timeout, ID ");
       kputs_hex(apic_ids[index]);
       kputs("\n");
-      break;
+      /* B-55: an AP that never answers is a fatal start, not a warning. The
+       * machine was told how many cores it has; running on fewer silently is
+       * exactly the kind of half-up state nobody can test against. The ID is
+       * on the line above; the screen gets the stop code. */
+      kpanic("AP_WAKE_TIMEOUT", "B 核未在 SIPI 预算内上线；单核降级不被接受");
     }
   }
   kputs("[SMP] online AP count ");

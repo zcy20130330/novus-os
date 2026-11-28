@@ -92,6 +92,7 @@ SRC := arch/x86_64/boot/main.c \
        kernel/klog.c \
        kernel/vga.c \
        kernel/serial.c \
+       kernel/panic.c \
        kernel/novuslib.c \
        kernel/shared_mem.c \
        kernel/pmm.c \

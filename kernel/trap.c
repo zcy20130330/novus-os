@@ -44,6 +44,7 @@
 #include "novu_apply.h"
 #include "net.h"
 #include "net_http.h"
+#include "panic.h"
 
 /* Syscall numbers (README part 8: one table, one ABI). */
 #define SYS_YIELD       1u
@@ -1220,9 +1221,58 @@ static void syscall_dispatch(trap_frame_t *f) {
   f->rax = (UINT64)-1;
 }
 
+/* B-55: a ring-0 fault ends in the blue screen, with the numbers a reader
+ * needs to say which fault it was. The log gets the same line as before; the
+ * screen gets a stop code and the three registers that identify the fault. */
+static void kernel_fault_stop(const char *name, UINT64 err, UINT64 rip,
+                              UINT64 cr2, int have_cr2) {
+  char   buf[120];
+  UINT32 n = 0u;
+  UINT64 vals[3];
+  static const char *keys[3] = {"err=", "rip=", "cr2="};
+  UINT32 k;
+  UINT32 i;
+
+  /* First line names the fault; the screen already knows the machine
+   * stopped, what it needs is which exception it was. */
+  for (i = 0u; name != 0 && name[i] != '\0' && n + 3u < sizeof(buf); i++) {
+    buf[n++] = name[i];
+  }
+  if (n + 2u < sizeof(buf)) {
+    buf[n++] = '\n';
+  }
+
+  vals[0] = err;
+  vals[1] = rip;
+  vals[2] = cr2;
+  for (k = 0u; k < ((have_cr2 != 0) ? 3u : 2u); k++) {
+    UINT64 v = vals[k];
+
+    for (i = 0u; keys[k][i] != '\0' && n + 2u < sizeof(buf); i++) {
+      buf[n++] = keys[k][i];
+    }
+    if (n + 3u < sizeof(buf)) {
+      buf[n++] = '0';
+      buf[n++] = 'x';
+    }
+    for (i = 16u; i > 0u && n + 2u < sizeof(buf); i--) {
+      UINT32 d = (UINT32)((v >> ((i - 1u) * 4u)) & 0xFu);
+
+      buf[n++] = (char)((d < 10u) ? ('0' + d) : ('a' + (d - 10u)));
+    }
+    if (k + 1u < ((have_cr2 != 0) ? 3u : 2u) && n + 2u < sizeof(buf)) {
+      buf[n++] = ' ';
+    }
+  }
+  buf[n] = '\0';
+  kpanic("KERNEL_FAULT", buf);
+}
+
 static void trap_exception(trap_frame_t *f) {
+  const char *nm = trap_name(f->vector);
+
   kputs("[TRAP] ");
-  kputs(trap_name(f->vector));
+  kputs(nm);
   kputs(" err=");
   kputs_hex(f->errcode);
   kputs(" rip=");
@@ -1240,6 +1290,16 @@ static void trap_exception(trap_frame_t *f) {
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
     kputs(" cr2=");
     kputs_hex(cr2);
+    kputs("\n");
+
+    if ((f->cs & 3u) == 3u) {
+      kputs("[TRAP] fault in user code: task terminated, kernel continues\n");
+      sched_exit_current(-1);
+      return;
+    }
+    kputs("[TRAP] kernel fault: stopping on the blue screen\n");
+    kernel_fault_stop(nm, f->errcode, f->rip, cr2, 1);
+    return;
   }
   kputs("\n");
 
@@ -1248,10 +1308,8 @@ static void trap_exception(trap_frame_t *f) {
     sched_exit_current(-1);
     return;
   }
-  kputs("[TRAP] kernel fault: halting\n");
-  for (;;) {
-    cpu_halt();
-  }
+  kputs("[TRAP] kernel fault: stopping on the blue screen\n");
+  kernel_fault_stop(nm, f->errcode, f->rip, 0u, 0);
 }
 
 UINT64 trap_dispatch(trap_frame_t *f) {

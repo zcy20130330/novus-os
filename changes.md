@@ -1649,3 +1649,29 @@ switch 内原分支保留作兜底。
 - `speeds`(PSIC) 非 0 时，PSI 表本身没有打印（只打了计数）；真机若要精确到“PSIV=4 才是 SuperSpeed”，需要再加一行读 0x0C+4*i。
 - `rev` 字段的 major/minor 拆分在规范版本间挪过位置，因此只打 raw word；真机上看到两条 proto 时，按“起始=1 的那条是 USB2”判断，不由该字段判断。
 - 镜像换了：`E78889921EEE675BD89EAAB8E0DF2652`（`novus-desktop.img`，64 MiB）。B-53 那版 `0E933CD15879F39B` 作废，U 盘要按新哈希重刷。
+
+## B-55 删掉启动诊断整屏页，改成 Windows 式蓝屏（只给真崩溃）
+
+**为什么** chen 截了一张“Novus OS · 启动诊断”的整屏页，说“什么鬼玩意 给我删了”。这一页出现的原因不是故障，而是**日志介质不可写**（U 盘启动时启动介质只读，`usblog_state()!=1` 是必然）：于是每次从 U 盘开机都会铺满一屏十六进制读数并 hold 45 s，把“正常启动”画成了“出事了”。它也顶着一张证据页的名头，实际上没人会拿它去测试。反过来，真正该铺满屏幕的场合——内核炸了、B 核起不来——以前只打一行日志然后死循环，屏幕黑着，什么也读不到。chen 同意要的是后者：“系统完全爆炸才蓝屏”。
+
+**做法**
+1. **删页面**：`kernel/kmain.c` 删 `diag_report()`、`rep_line()`、整屏绘制与 45 s hold 循环（每 250 ms 重绘 + `usb_hid_poll` + `usblog_retry` 全部去掉），该处只留 `diag_strip()` 组出的那一行 + `[BOOT] diag: …` + `usblog_retry()/usblog_flush(1)` + `[BOOT] report skipped: the page is gone`。`graphics/nd_demo.c` 的 `nd_demo_report_draw()` / `nd_demo_report()` 与 `graphics/nd.h` 的声明一并删除，不再留半条功能。
+2. **新增蓝屏** `graphics/nd_demo.c: nd_bsod(code, detail)`：深蓝底（`#005AB4`）+ 顶部深蓝条，大号 `:(`，两行中文说明，`停止代码：` + 代码，`detail` 按 `\n` 逐行（自动截断），底部 `完成 0%　·　这一屏不会自行消失`，末尾 `nd_present()` 整屏。只用启动期那套图元（无 WM、无分配、无字体加载），因为在 panic 里不能假设任何东西还在。`nd_canvas()==0` 时直接返回（还没初始化帧缓冲就只能靠串口）。
+3. **新增 `kernel/panic.c` / `panic.h`**：`kpanic(code, detail)` = cli → 置 `g_kernel_dead` → 打 `[PANIC] code: detail` → `usblog_flush(1)`（先把日志落到介质）→ `nd_bsod()` → 本核 `cpu_halt` 死等。`kpanic_raised()` 给其他核看。
+4. **接线**
+   - `kernel/trap.c`：ring0 故障不再死循环，改 `kernel_fault_stop()` → 组 `"#GP general protection\nerr=0x… rip=0x…"`（页故障再加 `cr2=0x…`）→ `kpanic("KERNEL_FAULT", …)`；ring3 故障仍然只杀任务（用户态错误不该蓝屏）。
+   - `kernel/smp.c`：`AP wake timeout` 由 `break`（静默降级成单核）改成 `kpanic("AP_WAKE_TIMEOUT", "B 核未在 SIPI 预算内上线；单核降级不被接受")`，AP ID 留在上一行日志里。
+   - `kernel/sched.c`：`sched_tick()` 开头若 `kpanic_raised()` 就本核 `cpu_halt` 死等，避免别核在已经停住的机器上继续碰设备。
+   - `Makefile`：`kernel/panic.c` 进 `SRC`。
+
+**验证** 构建 `exit=0`（仅剩既有的 `net_http.h` 注释告警）。QEMU（`-smp 2`，nvme 引导）两轮：
+- 自检轮（临时在 `sched_tick` 里 2 s 后写 0 页，取证后已删）：`[TRAP] #GP … rip=0x7d5d879f` → `[TRAP] kernel fault: stopping on the blue screen` → `[PANIC] KERNEL_FAULT: #GP general protection` → 截图即蓝屏页（深蓝、`:(`、`停止代码：KERNEL_FAULT`、`#GP general protection` + `err=/rip=`、`完成 0%`）。走的是真实 trap→panic 路径，不是直接调绘制。
+- 正式轮：`[BOOT] diag: logo=mk log=1 why=ACPI_BGRT ok` + `[BOOT] report skipped: the page is gone`，无整屏页、无 hold，桌面（用户会话创建窗 + 任务栏 + 桌面图标）正常出现。
+镜像 `90EF9F5D599B48C5C0C3DCA1476EAD3A`（`novus-desktop.img`，67,108,864 B）、iso `F2C5DC132EE0166D951BDDA8D5894D63`（63,442,944 B）。
+
+**未做/未验证**
+- 真机没验：蓝屏是 QEMU 里人为制造的 ring0 故障；真机上 AP 超时、真故障页面的分辨率适配（1024×768 之外的排版只按 `c->w/c->h` 粗略排，未逐分辨率调）都要等明天。
+- `[BOOT] diag:` 那行日志保留了（chen 只说删页面）；如果这行也不要，说一声就删。
+- 蓝屏不接管键盘：`cli` 之后不响应任何输入，也没有“重启”按钮，只能断电/复位——与 Windows 不一样，是有意的（panic 里不接受任何设备交互）。
+- 诊断页的另一个用途（“指针仍无效时拍照取证”）随之消失：现在取证靠 `out/` 里从 U 盘读回的日志；U 盘写不进去时机器就只剩串口，这是删页面的代价。
+- B-54 那版镜像 `E78889921EEE675BD89EAAB8E0DF2652` 作废，U 盘要按 `90EF9F5D599B48C5C0C3DCA1476EAD3A` 重刷。

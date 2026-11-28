@@ -18,6 +18,7 @@
 #include "vm.h"
 #include "ipc.h"
 #include "nd.h"
+#include "panic.h"
 #include "nwm.h"
 #include "sysinfo.h"
 #include "net.h"
@@ -553,6 +554,14 @@ static void sched_expire_waiters(void) {
 }
 
 void sched_tick(void) {
+  /* B-55: one core is on the blue screen. Park the others here instead of
+   * letting them schedule on a machine that has already stopped - they would
+   * keep touching devices the panicking core was mid-transfer with. */
+  if (kpanic_raised()) {
+    for (;;) {
+      cpu_halt();
+    }
+  }
   g_ticks++;
   sched_expire_waiters();
 

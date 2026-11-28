@@ -442,51 +442,60 @@ void nd_demo_banner(const char *text, UINT32 hold_ms) {
   nd_present(r);
 }
 
-/* Full-screen boot report: dark page, a title, the hint that says the
- * machine may now be switched off, and the caller's lines underneath. Held
- * for `hold_ms` and then the caller's next paint covers it. */
-void nd_demo_report_draw(const char *text) {
+/* B-55: the blue screen. Windows-shaped on purpose - deep blue, big ":(", one
+ * line that says what happened, the stop code, and the collecting-progress
+ * line - because a fatal stop is read by a human at arm's length, and the
+ * layout everybody already knows needs no explanation. Drawn with the same
+ * primitive calls the boot pages use, so it works with no window manager, no
+ * allocation, no font loading: a panic can happen anywhere, including inside
+ * the scheduler. */
+void nd_bsod(const char *code, const char *detail) {
   nd_surface_t *c = nd_canvas();
   nd_rect_t     r;
   INT32         y;
   UINT32        at = 0u;
 
-  if (c == 0 || text == 0) {
-    return;
+  if (c == 0) {
+    return; /* no framebuffer yet: the serial log is all there can be */
   }
   r = nd_rect(0, 0, c->w, c->h);
-  nd_fill_rect(c, r, ND_RGB(0x07, 0x0B, 0x12));
-  nd_fill_rect(c, nd_rect(0, 0, c->w, 6u), ND_RGB(0x2E, 0x9E, 0xFF));
-  nd_text(c, 24, 20, "Novus OS · 启动诊断", ND_RGB(0xA8, 0xD8, 0xFF), 2u);
-  nd_text(c, 24, 56, "把这一屏拍下来（或抄下数字），然后就可以关机了。",
-          ND_RGB(0xFF, 0xD4, 0x66), 1u);
+  nd_fill_rect(c, r, ND_RGB(0x00, 0x5A, 0xB4));
+  nd_fill_rect(c, nd_rect(0, 0, c->w, 8u), ND_RGB(0x00, 0x3D, 0x7C));
 
-  y = 92;
-  while (text[at] != '\0' && y + (INT32)(ND_CJK_H) < (INT32)c->h - 24) {
+  nd_text(c, 32, 40, ":(", ND_RGB(0xFF, 0xFF, 0xFF), 6u);
+  nd_text_limit(c, 32, 150, "你的设备遇到问题，需要重新启动。系统已停止。",
+                (UINT32)(c->w - 64), ND_RGB(0xFF, 0xFF, 0xFF), 2u);
+  nd_text_limit(c, 32, 200,
+                "如果这是第一次看到这个画面，请重启；重复出现说明硬件或内核有问题。",
+                (UINT32)(c->w - 64), ND_RGB(0xDD, 0xEB, 0xFF), 1u);
+  nd_text_limit(c, 32, 240, "我们只收集某些错误信息，然后为你重新启动。",
+                (UINT32)(c->w - 64), ND_RGB(0xDD, 0xEB, 0xFF), 1u);
+
+  nd_text(c, 32, 300, "停止代码：", ND_RGB(0xFF, 0xFF, 0xFF), 2u);
+  nd_text_limit(c, 200, 302, (code != 0) ? code : "UNKNOWN",
+                (UINT32)(c->w - 232), ND_RGB(0xFF, 0xFF, 0xFF), 2u);
+
+  y = 356;
+  while (detail != 0 && detail[at] != '\0' &&
+         y + (INT32)(ND_CJK_H) < (INT32)c->h - 60) {
     char   line[128];
     UINT32 n = 0u;
-    UINT32 max_px = (UINT32)(c->w - 48);
+    UINT32 max_px = (UINT32)(c->w - 64);
 
-    while (text[at] != '\0' && text[at] != '\n' && n + 1u < sizeof(line)) {
-      line[n++] = text[at++];
+    while (detail[at] != '\0' && detail[at] != '\n' && n + 1u < sizeof(line)) {
+      line[n++] = detail[at++];
     }
     line[n] = '\0';
-    if (text[at] == '\n') {
+    if (detail[at] == '\n') {
       at++;
     }
-    nd_text_limit(c, 24, y, line, max_px, ND_RGB(0xE6, 0xEE, 0xF8), 1u);
-    y += (INT32)ND_CJK_H + 6;
+    nd_text_limit(c, 32, y, line, max_px, ND_RGB(0xDD, 0xEB, 0xFF), 1u);
+    y += (INT32)ND_CJK_H + 4;
   }
-  nd_text_limit(c, 24, (INT32)c->h - 40, "日志若已写入，读卡即可；未写入就靠这一屏。",
-                (UINT32)(c->w - 48), ND_RGB(0x8F, 0xA6, 0xBF), 1u);
-  nd_present(r);
-}
 
-void nd_demo_report(const char *text, UINT32 hold_ms) {
-  nd_demo_report_draw(text);
-  if (hold_ms != 0u) {
-    nd_wait_ms(hold_ms);
-  }
+  nd_text_limit(c, 32, (INT32)c->h - 44, "完成 0%　·　这一屏不会自行消失",
+                (UINT32)(c->w - 64), ND_RGB(0xCE, 0xE1, 0xFA), 1u);
+  nd_present(r);
 }
 
 static void on_apply(ng_ctx_t *ctx, ng_widget_t *w) {

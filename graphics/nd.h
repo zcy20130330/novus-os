@@ -508,15 +508,13 @@ void nd_demo_status(const char *s);
  * repainted away. Nothing a client window can cover. */
 void nd_demo_banner(const char *text, UINT32 hold_ms);
 
-/* Full-screen boot report: one line per item, kept on the glass for
- * `hold_ms` before the desktop takes over. This is the report a machine with
- * no serial port gives: the numbers are on the screen, so a photograph of
- * this page is the whole diagnosis. */
-void nd_demo_report(const char *text, UINT32 hold_ms);
-
-/* Paint the full-screen report without the hold. The boot diagnostic loop
- * calls this between feed slices so the page reflects the latest port pass. */
-void nd_demo_report_draw(const char *text);
+/* B-55: the blue screen of a fatal stop. Windows-shaped - deep blue, big ":(",
+ * the stop code, the collecting line - and drawn with nothing but the boot
+ * primitives, so it works without a window manager, allocation or a font
+ * load. `code` is the stop code the log also carries
+ * (e.g. KERNEL_FAULT), `detail` may contain newlines. Returns without drawing
+ * when no framebuffer exists yet. */
+void nd_bsod(const char *code, const char *detail);
 
 /* Rebuild the shell widget tree after a theme change. Client windows are
  * owned by the WM and survive; the shell's own demo windows are recreated
